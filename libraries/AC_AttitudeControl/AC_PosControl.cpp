@@ -683,6 +683,11 @@ void AC_PosControl::update_xy_controller()
     _vel_target.xy() = vel_target;
     _vel_target.xy() += _vel_desired.xy() + _vel_offset.xy();
 
+    const float vel_target_limit_cms = MAX(_vel_max_xy_cms, (_vel_desired.xy() + _vel_offset.xy()).length());
+    if (is_positive(vel_target_limit_cms)) {
+        _vel_target.xy().limit_length(vel_target_limit_cms);
+    }
+
     // determine the combined velocity of the actual velocity and the disturbance from system ID mode
     const Vector2f &curr_vel = _inav.get_velocity_xy_cms();
     Vector2f comb_vel = curr_vel;
