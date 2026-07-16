@@ -751,6 +751,16 @@ bool AP_ExternalAHRS_SBG::send_MagData(AP_HAL::UARTDriver *_uart)
         mag_data_log.status |= (SBG_ECOM_MAG_MAG_X_BIT | SBG_ECOM_MAG_MAG_Y_BIT | SBG_ECOM_MAG_MAG_Z_BIT | SBG_ECOM_MAG_MAGS_IN_RANGE | SBG_ECOM_MAG_CALIBRATION_OK);
     }
 
+    const auto &ins = AP::ins();
+    if (ins.get_accel_health()) {
+        const Vector3f &accel = ins.get_accel();
+        mag_data_log.accelerometers[0] = accel.x;
+        mag_data_log.accelerometers[1] = accel.y;
+        mag_data_log.accelerometers[2] = accel.z;
+
+        mag_data_log.status |= (SBG_ECOM_MAG_ACCEL_X_BIT | SBG_ECOM_MAG_ACCEL_Y_BIT | SBG_ECOM_MAG_ACCEL_Z_BIT | SBG_ECOM_MAG_ACCELS_IN_RANGE);
+    }
+
     const sbgMessage msg = sbgMessage(SBG_ECOM_CLASS_LOG_ECOM_0, SBG_ECOM_LOG_MAG, (uint8_t*)&mag_data_log, sizeof(mag_data_log));
     return send_sbgMessage(_uart, msg);
 }
