@@ -13,13 +13,14 @@
     0x2E0946   cell voltages 11..14 (mV)
     0x2E0947   cell voltages 15..18 (mV)
     0x2E094A   cell voltages 23..24 (mV)
-    0x2E0951   unknown (counter/crc), pack voltage (10 mV)
-    0x401A100  SOC (%), unknown, unknown        (every 200 ms)
-    0x402A100  status + rolling counter, unused (every 2 s)
+    0x2E0951   counter/crc, pack voltage (10 mV), current (s32, 2 mA,
+               negative = discharge, reads 0 below a few amps)
+    0x401A100  SOC (%), pack voltage mirror (1/320 V), temperature?  (200 ms)
+    0x402A100  zeros, current coarse copy (s16, 0.2 A), const        (2 s)
 
-  the 0x2E09xx group repeats every ~500 ms. The pack current has not
-  been identified yet (suspected in 0x401A100), so this backend does
-  not provide current.
+  the 0x2E09xx group repeats every ~500 ms. The current scale was
+  calibrated against an ArduPilot analog power module (steady-load
+  plateaus 13..48 A gave 2.05 +/- 0.05 mA/LSB -> 2 mA nominal).
  */
 #include "AP_BattMonitor_ZhiannBMS.h"
 
@@ -44,6 +45,9 @@
 
 // consider the BMS gone after 5s without a pack voltage frame
 #define ZHIANN_TIMEOUT_US      5000000UL
+
+// current scale, amps per LSB of the s32 in 0x2E0951 (discharge negative)
+#define ZHIANN_CURRENT_SCALE   0.002f
 
 AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
         AP_BattMonitor::BattMonitor_State &mon_state,
@@ -83,8 +87,23 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
     switch (id) {
     case ZHIANN_ID_PACK_VOLT:
         if (frame.dlc >= 4) {
+            const uint32_t now_us = AP_HAL::micros();
             _interim.voltage = le16toh_ptr(&frame.data[2]) * 0.01f;
-            _interim.last_frame_us = AP_HAL::micros();
+            if (frame.dlc >= 8) {
+                // BMS sign convention is discharge-negative; ArduPilot's is
+                // discharge-positive
+                const int32_t raw = (int32_t)le32toh_ptr(&frame.data[4]);
+                _interim.current_amps = -raw * ZHIANN_CURRENT_SCALE;
+                if (_interim.have_current && _interim.last_frame_us != 0) {
+                    const uint32_t dt_us = now_us - _interim.last_frame_us;
+                    _interim.consumed_mah +=
+                        calculate_mah(_interim.current_amps, dt_us);
+                    _interim.consumed_wh += _interim.current_amps *
+                        _interim.voltage * dt_us * 1.0e-6f / 3600.0f;
+                }
+                _interim.have_current = true;
+            }
+            _interim.last_frame_us = now_us;
         }
         break;
 
@@ -157,18 +176,29 @@ void AP_BattMonitor_ZhiannBMS::read()
     const uint32_t tnow_us = AP_HAL::micros();
     if (_interim.last_frame_us == 0 ||
         (tnow_us - _interim.last_frame_us) > ZHIANN_TIMEOUT_US) {
+        // BMS gone: report zero rather than freezing the last reading.
+        // 0V is ArduPilot's "no reading" convention and cannot trigger
+        // the voltage failsafes, which are guarded by voltage > 0
         _state.healthy = false;
+        _state.voltage = 0;
+        _state.current_amps = 0;
+        _has_cell_voltages = false;
+        _has_temperature = false;
         return;
     }
 
     _state.healthy = true;
     _state.voltage = _interim.voltage;
+    _state.current_amps = _interim.current_amps;
+    _state.consumed_mah = _interim.consumed_mah;
+    _state.consumed_wh = _interim.consumed_wh;
     _state.last_time_micros = _interim.last_frame_us;
     _state.temperature = _interim.temperature;
     _state.temperature_time = _interim.temperature_time_ms;
     memcpy(_state.cell_voltages.cells, _interim.cells_mv,
            sizeof(_state.cell_voltages.cells));
 
+    _have_current = _interim.have_current;
     _has_cell_voltages = _interim.cells_seen;
     _has_temperature = (_interim.temperature_time_ms != 0) &&
         ((AP_HAL::millis() - _interim.temperature_time_ms) <= AP_BATT_MONITOR_TIMEOUT);
