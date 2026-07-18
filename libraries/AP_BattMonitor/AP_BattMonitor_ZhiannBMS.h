@@ -7,7 +7,7 @@
 #include "AP_BattMonitor_Backend.h"
 #include <AP_CANManager/AP_CANSensor.h>
 
-class AP_BattMonitor_ZhiannBMS : public CANSensor, public AP_BattMonitor_Backend {
+class AP_BattMonitor_ZhiannBMS : public AP_BattMonitor_Backend {
 public:
     AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
                              AP_BattMonitor::BattMonitor_State &mon_state,
@@ -24,12 +24,19 @@ public:
     bool capacity_remaining_pct(uint8_t &percentage) const override;
 
 private:
-    // handler for incoming frames, runs in the CAN driver thread
-    void handle_frame(AP_HAL::CANFrame &frame) override;
+    // handler for frames from MultiCAN, runs in the CAN driver thread.
+    // returns true if the frame was consumed by this instance
+    bool handle_frame(AP_HAL::CANFrame &frame);
 
     void store_cells(uint8_t first_cell, const uint8_t *data, uint8_t ncells);
 
+    MultiCAN *_multican;
+
     HAL_Semaphore _sem;
+
+    // pack (node) this instance is bound to: BATTn_SERIAL_NUM if >= 0,
+    // else locked to the first unconsumed pack heard on the bus
+    int8_t _node = -1;
 
     // state accumulated from CAN frames, copied into _state by read()
     struct {
