@@ -1,61 +1,81 @@
 /*
   battery monitor for the Zhiann CAN BMS
 
-  protocol reverse engineered from a live 24S pack (2026-07): 1 Mbit/s
-  classic CAN, all IDs 29-bit extended, all values little-endian u16
-  unless noted:
+  protocol reverse engineered from live packs (2026-07): 1 Mbit/s classic
+  CAN, all IDs 29-bit extended, values little-endian u16 unless noted.
 
-    0x2E0941   cell voltages 19..22 (mV)
-    0x2E0942   temperature1 (0.1 C), temperature2 (0.1 C), SOC (0.1 %)
-    0x2E0943   unknown, cell count, cell voltages 1..2 (mV)
-    0x2E0944   cell voltages 3..6 (mV)
-    0x2E0945   cell voltages 7..10 (mV)
-    0x2E0946   cell voltages 11..14 (mV)
-    0x2E0947   cell voltages 15..18 (mV)
-    0x2E094A   cell voltages 23..24 (mV)
-    0x2E0951   counter/crc, pack voltage (10 mV), current (s32, 2 mA,
-               negative = discharge, reads 0 below a few amps)
-    0x401A100  SOC (%), pack voltage mirror (1/320 V), temperature?  (200 ms)
-    0x402A100  zeros, current coarse copy (s16, 0.2 A), const        (2 s)
+  Up to 4 packs share the bus. Pack n (0..3) transmits the ID block
+  0x2E0941 + 0x20*n plus an SOC frame at 0x401A100 + n. Node numbering
+  follows hub/chain position. Frame types within a pack block (offset
+  from 0x...41):
 
-  the 0x2E09xx group repeats every ~500 ms. The current scale was
-  calibrated against an ArduPilot analog power module (steady-load
-  plateaus 13..48 A gave 2.05 +/- 0.05 mA/LSB -> 2 mA nominal).
+    +0x00  cell voltages 19..22 (mV)
+    +0x01  temperature1 (0.1 C), temperature2 (0.1 C), SOC (0.1 %)
+    +0x02  unknown, cell count, cell voltages 1..2 (mV)
+    +0x03  cell voltages 3..6 (mV)
+    +0x04  cell voltages 7..10 (mV)
+    +0x05  cell voltages 11..14 (mV)
+    +0x06  cell voltages 15..18 (mV)
+    +0x09  cell voltages 23..24 (mV)
+    +0x10  counter/crc, pack voltage (10 mV), current (s32, 2 mA,
+           negative = discharge, reads 0 below a few amps)
+
+  0x401A100+n: SOC (%), pack voltage mirror (1/320 V), temperature?
+  0x402A100: single transmitter on the bus, unused here.
+
+  The pack block repeats every ~500 ms. The current scale was calibrated
+  against an ArduPilot analog power module (steady-load plateaus 13..48 A
+  gave 2.05 +/- 0.05 mA/LSB -> 2 mA nominal).
+
+  Instance selection: set BATTn_SERIAL_NUM to the pack node (0..3), or
+  leave -1 to bind to the first pack not consumed by another instance.
  */
 #include "AP_BattMonitor_ZhiannBMS.h"
 
 #if AP_BATTERY_ZHIANNBMS_ENABLED
 
+#include <AP_BoardConfig/AP_BoardConfig.h>
 #include <AP_HAL/AP_HAL.h>
 #include <AP_HAL/utility/sparse-endian.h>
 
 #include <string.h>
 
-// frame IDs (29-bit extended)
-#define ZHIANN_ID_CELL_19_22   0x2E0941UL
-#define ZHIANN_ID_TEMP_SOC     0x2E0942UL
-#define ZHIANN_ID_CELL_1_2     0x2E0943UL
-#define ZHIANN_ID_CELL_3_6     0x2E0944UL
-#define ZHIANN_ID_CELL_7_10    0x2E0945UL
-#define ZHIANN_ID_CELL_11_14   0x2E0946UL
-#define ZHIANN_ID_CELL_15_18   0x2E0947UL
-#define ZHIANN_ID_CELL_23_24   0x2E094AUL
-#define ZHIANN_ID_PACK_VOLT    0x2E0951UL
-#define ZHIANN_ID_STATUS_FAST  0x401A100UL
+// pack n block: 0x2E0941 + 0x20*n, frame type = low 5 bits of (id - 0x41)
+#define ZHIANN_BLOCK_BASE      0x2E0941UL
+#define ZHIANN_BLOCK_LAST      0x2E09B1UL
+#define ZHIANN_SOC_BASE        0x401A100UL
+
+// frame types within a pack block
+#define ZHIANN_FRAME_CELL_19_22   0x00
+#define ZHIANN_FRAME_TEMP_SOC     0x01
+#define ZHIANN_FRAME_CELL_1_2     0x02
+#define ZHIANN_FRAME_CELL_3_6     0x03
+#define ZHIANN_FRAME_CELL_7_10    0x04
+#define ZHIANN_FRAME_CELL_11_14   0x05
+#define ZHIANN_FRAME_CELL_15_18   0x06
+#define ZHIANN_FRAME_CELL_23_24   0x09
+#define ZHIANN_FRAME_PACK_VOLT    0x10
+#define ZHIANN_FRAME_SOC_COARSE   0x1F   // internal alias for 0x401A100+n
 
 // consider the BMS gone after 5s without a pack voltage frame
 #define ZHIANN_TIMEOUT_US      5000000UL
 
-// current scale, amps per LSB of the s32 in 0x2E0951 (discharge negative)
+// current scale, amps per LSB of the s32 in the pack voltage frame
+// (discharge negative)
 #define ZHIANN_CURRENT_SCALE   0.002f
 
 AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
         AP_BattMonitor::BattMonitor_State &mon_state,
         AP_BattMonitor_Params &params)
-    : CANSensor("ZhiannBMS"),
-      AP_BattMonitor_Backend(mon, mon_state, params)
+    : AP_BattMonitor_Backend(mon, mon_state, params)
 {
-    register_driver(AP_CAN::Protocol::ZhiannBMS);
+    _multican = NEW_NOTHROW MultiCAN{
+        FUNCTOR_BIND_MEMBER(&AP_BattMonitor_ZhiannBMS::handle_frame,
+                            bool, AP_HAL::CANFrame &),
+        AP_CAN::Protocol::ZhiannBMS, "ZhiannBMS"};
+    if (_multican == nullptr) {
+        AP_BoardConfig::allocation_error("Failed to create ZhiannBMS multican");
+    }
 
     // cells not yet received report as not-present
     memset(_interim.cells_mv, 0xFF, sizeof(_interim.cells_mv));
@@ -75,17 +95,42 @@ void AP_BattMonitor_ZhiannBMS::store_cells(uint8_t first_cell, const uint8_t *da
     _interim.cells_seen = true;
 }
 
-void AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
+bool AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
 {
     if (!frame.isExtended() || frame.isRemoteTransmissionRequest() || frame.isErrorFrame()) {
-        return;
+        return false;
     }
     const uint32_t id = frame.id & AP_HAL::CANFrame::MaskExtID;
 
+    uint8_t node;
+    uint8_t frame_type;
+    if (id >= ZHIANN_BLOCK_BASE && id <= ZHIANN_BLOCK_LAST) {
+        node = (id - ZHIANN_BLOCK_BASE) >> 5;
+        frame_type = (id - ZHIANN_BLOCK_BASE) & 0x1F;
+    } else if ((id & ~0xFUL) == ZHIANN_SOC_BASE && (id & 0xF) <= 3) {
+        node = id & 0xF;
+        frame_type = ZHIANN_FRAME_SOC_COARSE;
+    } else {
+        return false;
+    }
+
+    // bind this instance to a pack: explicit BATTn_SERIAL_NUM, or first
+    // pack heard that no earlier-called instance consumed
+    const int32_t serial = _params._serial_number.get();
+    if (serial >= 0) {
+        if (node != (uint8_t)serial) {
+            return false;
+        }
+    } else if (_node < 0) {
+        _node = (int8_t)node;
+    } else if (node != (uint8_t)_node) {
+        return false;
+    }
+
     WITH_SEMAPHORE(_sem);
 
-    switch (id) {
-    case ZHIANN_ID_PACK_VOLT:
+    switch (frame_type) {
+    case ZHIANN_FRAME_PACK_VOLT:
         if (frame.dlc >= 4) {
             const uint32_t now_us = AP_HAL::micros();
             _interim.voltage = le16toh_ptr(&frame.data[2]) * 0.01f;
@@ -107,7 +152,7 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
         }
         break;
 
-    case ZHIANN_ID_TEMP_SOC:
+    case ZHIANN_FRAME_TEMP_SOC:
         if (frame.dlc >= 6) {
             // two sensors; report the hotter one
             const float t1 = le16toh_ptr(&frame.data[0]) * 0.1f;
@@ -120,7 +165,7 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
         }
         break;
 
-    case ZHIANN_ID_STATUS_FAST:
+    case ZHIANN_FRAME_SOC_COARSE:
         // coarse SOC, only used if the 0.1% frame is not being sent
         if (frame.dlc >= 2 && !_interim.soc_is_fine) {
             _interim.soc_pct = MIN(le16toh_ptr(&frame.data[0]), 100);
@@ -128,45 +173,47 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
         }
         break;
 
-    case ZHIANN_ID_CELL_1_2:
+    case ZHIANN_FRAME_CELL_1_2:
         if (frame.dlc >= 8) {
             store_cells(0, &frame.data[4], 2);
         }
         break;
-    case ZHIANN_ID_CELL_3_6:
+    case ZHIANN_FRAME_CELL_3_6:
         if (frame.dlc >= 8) {
             store_cells(2, frame.data, 4);
         }
         break;
-    case ZHIANN_ID_CELL_7_10:
+    case ZHIANN_FRAME_CELL_7_10:
         if (frame.dlc >= 8) {
             store_cells(6, frame.data, 4);
         }
         break;
-    case ZHIANN_ID_CELL_11_14:
+    case ZHIANN_FRAME_CELL_11_14:
         if (frame.dlc >= 8) {
             store_cells(10, frame.data, 4);
         }
         break;
-    case ZHIANN_ID_CELL_15_18:
+    case ZHIANN_FRAME_CELL_15_18:
         if (frame.dlc >= 8) {
             store_cells(14, frame.data, 4);
         }
         break;
-    case ZHIANN_ID_CELL_19_22:
+    case ZHIANN_FRAME_CELL_19_22:
         if (frame.dlc >= 8) {
             store_cells(18, frame.data, 4);
         }
         break;
-    case ZHIANN_ID_CELL_23_24:
+    case ZHIANN_FRAME_CELL_23_24:
         if (frame.dlc >= 4) {
             store_cells(22, frame.data, 2);
         }
         break;
 
     default:
+        // unknown frame type from our pack: consumed but ignored
         break;
     }
+    return true;
 }
 
 void AP_BattMonitor_ZhiannBMS::read()
