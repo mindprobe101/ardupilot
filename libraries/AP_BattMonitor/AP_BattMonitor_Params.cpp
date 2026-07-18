@@ -88,7 +88,7 @@ const AP_Param::GroupInfo AP_BattMonitor_Params::var_info[] = {
 
     // @Param: SERIAL_NUM
     // @DisplayName: Battery serial number
-    // @Description: Battery serial number, automatically filled in for SMBus batteries, otherwise will be -1. With DroneCan it is the battery_id.
+    // @Description: Battery serial number, automatically filled in for SMBus batteries, otherwise will be -1. With DroneCan it is the battery_id. With ZhiannBMS it is the pack node number on the bus (0-15), or -1 to bind to the first unclaimed pack.
     // @User: Advanced
     AP_GROUPINFO("SERIAL_NUM", 9, AP_BattMonitor_Params, _serial_number, AP_BATT_SERIAL_NUMBER_DEFAULT),
 
