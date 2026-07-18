@@ -15,9 +15,8 @@ public:
 
     void read() override;
 
-    // the current field of the protocol has not been identified yet
-    bool has_current() const override { return false; }
-    bool has_consumed_energy() const override { return false; }
+    bool has_current() const override { return _have_current; }
+    bool has_consumed_energy() const override { return _have_current; }
     bool has_cell_voltages() const override { return _has_cell_voltages; }
     bool has_temperature() const override { return _has_temperature; }
 
@@ -35,16 +34,21 @@ private:
     // state accumulated from CAN frames, copied into _state by read()
     struct {
         float voltage;
+        float current_amps;
+        float consumed_mah;
+        float consumed_wh;
         float temperature;
         uint32_t temperature_time_ms;
         uint32_t last_frame_us;
         uint16_t cells_mv[AP_BATT_MONITOR_CELLS_MAX];
         bool cells_seen;
+        bool have_current;
         uint8_t soc_pct;
         bool soc_valid;
         bool soc_is_fine;   // SOC seen from the 0.1% resolution frame
     } _interim;
 
+    bool _have_current;
     bool _has_cell_voltages;
     bool _has_temperature;
 };
