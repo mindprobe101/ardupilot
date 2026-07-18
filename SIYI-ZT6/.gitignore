@@ -1,0 +1,2 @@
+# firmware in this folder is a deliverable, not a build artifact
+!*.apj

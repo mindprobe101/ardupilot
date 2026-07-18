@@ -1,0 +1,119 @@
+{
+    "version":    1,
+    "fileType":   "CustomActions",
+    "actions": [
+        {
+      "label":        "Zoom Camera",
+      "description":  "main cam  ",
+      "mavCmd":       534,
+      "param1":       1,
+      "param2":       1,
+      "param3":       0
+
+    },
+    {
+      "label":        "Thermal Camera",
+      "description":  "IR",
+      "mavCmd":       534,
+      "param1":       1,
+      "param2":       2,
+      "param3":       0
+    },
+    {
+      "label":        "Zoom and Thermal",
+      "description":  "IR",
+      "mavCmd":       534,
+      "param1":       1,
+      "param2":       1,
+      "param3":       2
+    },
+	{
+      "label":        "Capture Image",
+      "description":  "Capture Image ",
+      "mavCmd":       2000,
+      "param1":       0,
+      "param2":       0,
+      "param3":       1,
+      "param4":       1,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "Start Recording",
+      "description":  "video rec ",
+      "mavCmd":       2500,
+      "param1":       0,
+      "param2":       0,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "Stop Recording",
+      "description":  "video rec ",
+      "mavCmd":       2501,
+      "param1":       0,
+      "param2":       0,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "Whitehot",
+      "description":  "Thermal Palette",
+      "mavCmd":       183,
+      "param1":       16,
+      "param2":       1100,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "Blackhot",
+      "description":  "Thermal Palette",
+      "mavCmd":       183,
+      "param1":       16,
+      "param2":       1200,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "IronBow",
+      "description":  "Thermal Palette",
+      "mavCmd":       183,
+      "param1":       16,
+      "param2":       1300,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "Rainbow",
+      "description":  "Thermal Palette",
+      "mavCmd":       183,
+      "param1":       16,
+      "param2":       1400,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    },
+	{
+      "label":        "RedHot",
+      "description":  "Thermal Palette",
+      "mavCmd":       183,
+      "param1":       16,
+      "param2":       1500,
+      "param3":       0,
+      "param4":       0,
+      "param5":       0,
+      "param6":       0
+    }
+    ]
+}
