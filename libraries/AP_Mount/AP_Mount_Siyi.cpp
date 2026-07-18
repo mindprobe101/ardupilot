@@ -990,52 +990,92 @@ bool AP_Mount_Siyi::set_lens(uint8_t lens)
 // primary and secondary sources use the AP_Camera::CameraSource enum cast to uint8_t
 bool AP_Mount_Siyi::set_camera_source(uint8_t primary_source, uint8_t secondary_source)
 {
-    // only supported on ZT30.  sanity check lens values
-    if (_hardware_model != HardwareModel::ZT30) {
+    // only supported on ZT6 and ZT30.  sanity check lens values
+    if (_hardware_model != HardwareModel::ZT6 &&
+        _hardware_model != HardwareModel::ZT30) {
         return false;
     }
 
     // maps primary and secondary source to siyi camera image type
     CameraImageType cam_image_type;
-    switch (primary_source) {
-    case 0: // Default (RGB)
-        FALLTHROUGH;
-    case 1: // RGB
-        switch (secondary_source) {
-        case 0: // RGB + Default (None)
-            cam_image_type = CameraImageType::MAIN_ZOOM_SUB_THERMAL;                // 3
+
+    switch (_hardware_model) {
+
+    case HardwareModel::ZT30:
+        switch (primary_source) {
+        case 0: // Default (RGB)
+            FALLTHROUGH;
+        case 1: // RGB
+            switch (secondary_source) {
+            case 0: // RGB + Default (None)
+                cam_image_type = CameraImageType::MAIN_ZOOM_SUB_THERMAL;                // 3
+                break;
+            case 2: // PIP RGB+IR
+                cam_image_type = CameraImageType::MAIN_PIP_ZOOM_THERMAL_SUB_WIDEANGLE;  // 0
+                break;
+            case 4: // PIP RGB+RGB_WIDEANGLE
+                cam_image_type = CameraImageType::MAIN_PIP_ZOOM_WIDEANGLE_SUB_THERMAL;  // 2
+                break;
+            default:
+                return false;
+            }
             break;
-        case 2: // PIP RGB+IR
-            cam_image_type = CameraImageType::MAIN_PIP_ZOOM_THERMAL_SUB_WIDEANGLE;  // 0
+        case 2: // IR
+            switch (secondary_source) {
+            case 0: // IR + Default (None)
+                cam_image_type = CameraImageType::MAIN_THERMAL_SUB_ZOOM;                // 7
+                break;
+            default:
+                return false;
+            }
             break;
-        case 4: // PIP RGB+RGB_WIDEANGLE
-            cam_image_type = CameraImageType::MAIN_PIP_ZOOM_WIDEANGLE_SUB_THERMAL;  // 2
+        case 4: // RGB_WIDEANGLE
+            switch (secondary_source) {
+            case 0: // RGB_WIDEANGLE + Default (None)
+                cam_image_type = CameraImageType::MAIN_WIDEANGLE_SUB_THERMAL;           // 5
+                break;
+            case 2: // PIP RGB_WIDEANGLE+IR
+                cam_image_type = CameraImageType::MAIN_PIP_WIDEANGLE_THERMAL_SUB_ZOOM;  // 1
+                break;
+            default:
+                return false;
+            }
             break;
         default:
             return false;
         }
         break;
-    case 2: // IR
-        switch (secondary_source) {
-        case 0: // IR + Default (None)
-            cam_image_type = CameraImageType::MAIN_THERMAL_SUB_ZOOM;                // 7
+
+    case HardwareModel::ZT6:
+        switch (primary_source) {
+        case 0: // Default (RGB)
+            FALLTHROUGH;
+        case 1: // RGB
+            switch (secondary_source) {
+            case 0: // RGB + Default (None)
+                cam_image_type = CameraImageType::MAIN_ZOOM_SUB_THERMAL;                // 3
+                break;
+            case 2: // PIP RGB+IR
+                cam_image_type = CameraImageType::MAIN_PIP_ZOOM_THERMAL_SUB_WIDEANGLE;  // 0
+                break;
+            default:
+                return false;
+            }
+            break;
+        case 2: // IR
+            switch (secondary_source) {
+            case 0: // IR + Default (None)
+                cam_image_type = CameraImageType::MAIN_THERMAL_SUB_ZOOM;                // 7
+                break;
+            default:
+                return false;
+            }
             break;
         default:
             return false;
         }
         break;
-    case 4: // RGB_WIDEANGLE
-        switch (secondary_source) {
-        case 0: // RGB_WIDEANGLE + Default (None)
-            cam_image_type = CameraImageType::MAIN_WIDEANGLE_SUB_THERMAL;           // 5
-            break;
-        case 2: // PIP RGB_WIDEANGLE+IR
-            cam_image_type = CameraImageType::MAIN_PIP_WIDEANGLE_THERMAL_SUB_ZOOM;  // 1
-            break;
-        default:
-            return false;
-        }
-        break;
+
     default:
         return false;
     }
