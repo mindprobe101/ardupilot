@@ -15,47 +15,60 @@ public:
 
     void read() override;
 
-    bool has_current() const override { return _have_current; }
-    bool has_consumed_energy() const override { return _have_current; }
+    bool has_current() const override { return _has_current; }
+    bool has_consumed_energy() const override { return _has_current; }
     bool has_cell_voltages() const override { return _has_cell_voltages; }
     bool has_temperature() const override { return _has_temperature; }
 
-    // SOC is reported directly by the BMS
+    // BMS-reported SOC when available, else base-class coulomb count
     bool capacity_remaining_pct(uint8_t &percentage) const override;
 
+    static const struct AP_Param::GroupInfo var_info[];
+
 private:
-    // handler for frames from MultiCAN, runs in the CAN driver thread.
-    // returns true if the frame was consumed by this instance
-    bool handle_frame(AP_HAL::CANFrame &frame);
+    // single shared MultiCAN callback: decodes the frame and dispatches
+    // to the owning instance deterministically (in BATTn instance order)
+    bool dispatch_frame(AP_HAL::CANFrame &frame);
+
+    // returns true if this instance is bound to the given pack node
+    bool matches_node(uint8_t node) const;
+
+    // returns true if any instance explicitly selects this node via
+    // BATTn_SERIAL_NUM
+    static bool node_claimed(uint8_t node);
+
+    // process one frame from this instance's pack (CAN driver thread)
+    void handle_pack_frame(uint8_t frame_type, AP_HAL::CANFrame &frame);
 
     void store_cells(uint8_t first_cell, const uint8_t *data, uint8_t ncells);
 
-    MultiCAN *_multican;
+    // all instances share one MultiCAN (registered by the first instance)
+    static MultiCAN *_multican;
+    static AP_BattMonitor_ZhiannBMS *_instances[AP_BATT_MONITOR_MAX_INSTANCES];
+    static uint8_t _num_instances;
+
+    AP_Float _curr_mult;
 
     HAL_Semaphore _sem;
 
-    // pack (node) this instance is bound to: BATTn_SERIAL_NUM if >= 0,
-    // else locked to the first unconsumed pack heard on the bus
-    int8_t _node = -1;
+    // pack node this instance is bound to when BATTn_SERIAL_NUM is -1;
+    // only accessed from the CAN dispatch thread
+    int8_t _auto_node = -1;
 
-    // state accumulated from CAN frames, copied into _state by read()
-    struct {
-        float voltage;
-        float current_amps;
-        float consumed_mah;
-        float consumed_wh;
-        float temperature;
-        uint32_t temperature_time_ms;
-        uint32_t last_frame_us;
-        uint16_t cells_mv[AP_BATT_MONITOR_CELLS_MAX];
-        bool cells_seen;
-        bool have_current;
-        uint8_t soc_pct;
-        bool soc_valid;
-        bool soc_is_fine;   // SOC seen from the 0.1% resolution frame
-    } _interim;
+    // state accumulated from CAN frames under _sem, copied into _state
+    // by read()
+    AP_BattMonitor::BattMonitor_State _interim_state {};
+    uint64_t _last_frame_us;        // 64-bit: liveness check cannot wrap
+    uint32_t _fine_soc_ms;          // last 0.1%-resolution SOC frame
+    uint8_t _soc_pct;
+    bool _soc_valid;
+    bool _cells_seen;
+    bool _current_seen;
 
-    bool _have_current;
+    // copies published by read() for lock-free main-thread accessors
+    uint8_t _soc_pct_pub;
+    bool _soc_valid_pub;
+    bool _has_current;
     bool _has_cell_voltages;
     bool _has_temperature;
 };
