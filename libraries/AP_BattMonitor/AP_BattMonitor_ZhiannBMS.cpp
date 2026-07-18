@@ -4,10 +4,12 @@
   protocol reverse engineered from live packs (2026-07): 1 Mbit/s classic
   CAN, all IDs 29-bit extended, values little-endian u16 unless noted.
 
-  Up to 4 packs share the bus. Pack n (0..3) transmits the ID block
-  0x2E0941 + 0x20*n plus an SOC frame at 0x401A100 + n. Node numbering
-  follows hub/chain position. Frame types within a pack block (offset
-  from 0x...41):
+  Multiple packs share the bus. Pack n transmits the ID block
+  0x2E0941 + 0x20*n plus an SOC frame at 0x401A100 + n (4 packs
+  observed live; the ID arithmetic is extrapolated up to node 15, the
+  SOC frame's node nibble - ArduPilot itself supports 9 monitors).
+  Node numbering follows hub/chain position. Frame types within a pack
+  block (offset from 0x...41):
 
     +0x00  cell voltages 19..22 (mV)
     +0x01  temperature1 (0.1 C), temperature2 (0.1 C), SOC (0.1 %)
@@ -42,8 +44,9 @@
 
 // pack n block: 0x2E0941 + 0x20*n, frame type = low 5 bits of (id - 0x41)
 #define ZHIANN_BLOCK_BASE      0x2E0941UL
-#define ZHIANN_BLOCK_LAST      0x2E09B1UL
 #define ZHIANN_SOC_BASE        0x401A100UL
+// highest pack node: bounded by the node nibble of the SOC frame ID
+#define ZHIANN_MAX_NODE        15
 
 // frame types within a pack block
 #define ZHIANN_FRAME_CELL_19_22   0x00
@@ -104,10 +107,11 @@ bool AP_BattMonitor_ZhiannBMS::handle_frame(AP_HAL::CANFrame &frame)
 
     uint8_t node;
     uint8_t frame_type;
-    if (id >= ZHIANN_BLOCK_BASE && id <= ZHIANN_BLOCK_LAST) {
+    if (id >= ZHIANN_BLOCK_BASE &&
+        id < ZHIANN_BLOCK_BASE + 0x20UL * (ZHIANN_MAX_NODE + 1)) {
         node = (id - ZHIANN_BLOCK_BASE) >> 5;
         frame_type = (id - ZHIANN_BLOCK_BASE) & 0x1F;
-    } else if ((id & ~0xFUL) == ZHIANN_SOC_BASE && (id & 0xF) <= 3) {
+    } else if ((id & ~0xFUL) == ZHIANN_SOC_BASE) {
         node = id & 0xF;
         frame_type = ZHIANN_FRAME_SOC_COARSE;
     } else {
