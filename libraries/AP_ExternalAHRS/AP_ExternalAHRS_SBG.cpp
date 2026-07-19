@@ -464,6 +464,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                 // float	eulerStdDev[3];			/*!< Roll, Pitch and Yaw angles 1 sigma standard deviation in rad. */
                 state.quat.from_euler(cached.sbg.ekfEuler.euler[0], cached.sbg.ekfEuler.euler[1], cached.sbg.ekfEuler.euler[2]);
                 state.have_quaternion = true;
+                last_att_ms = now_ms;
                 break;
             
             case SBG_ECOM_LOG_EKF_QUAT: // 7
@@ -473,6 +474,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                 // float	eulerStdDev[3];			/*!< Roll, Pitch and Yaw angles 1 sigma standard deviation in rad. */
                 memcpy(&state.quat, cached.sbg.ekfQuat.quaternion, sizeof(state.quat));
                 state.have_quaternion = true;
+                last_att_ms = now_ms;
                 break;
 
             case SBG_ECOM_LOG_EKF_NAV: // 8
@@ -778,6 +780,17 @@ bool AP_ExternalAHRS_SBG::pre_arm_check(char *failure_msg, uint8_t failure_msg_l
     }
     if (!healthy()) {
         hal.util->snprintf(failure_msg, failure_msg_len, "SBG unhealthy");
+        return false;
+    }
+
+    WITH_SEMAPHORE(state.sem);
+    const uint32_t now_ms = AP_HAL::millis();
+    if (last_ekf_nav_ms == 0 || now_ms - last_ekf_nav_ms > 500) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "SBG EKF data stale");
+        return false;
+    }
+    if (last_att_ms == 0 || now_ms - last_att_ms > 500) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "SBG no attitude data");
         return false;
     }
     return true;
