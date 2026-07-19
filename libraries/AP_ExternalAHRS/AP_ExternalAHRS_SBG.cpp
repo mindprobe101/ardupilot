@@ -453,9 +453,6 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
             case SBG_ECOM_LOG_MAG: // 4
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.mag, sizeof(cached.sbg.mag), msg.data, msg.len);
 
-                state.accel = Vector3f(cached.sbg.mag.accelerometers[0], cached.sbg.mag.accelerometers[1], cached.sbg.mag.accelerometers[2]);
-                updated_ins = true;
-
                 cached.sensors.mag_data.field = Vector3f(cached.sbg.mag.magnetometers[0], cached.sbg.mag.magnetometers[1], cached.sbg.mag.magnetometers[2]) * 1000.0f;
                 updated_mag = true;
                 break;
