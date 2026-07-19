@@ -456,7 +456,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                 state.accel = Vector3f(cached.sbg.mag.accelerometers[0], cached.sbg.mag.accelerometers[1], cached.sbg.mag.accelerometers[2]);
                 updated_ins = true;
 
-                cached.sensors.mag_data.field = Vector3f(cached.sbg.mag.magnetometers[0], cached.sbg.mag.magnetometers[1], cached.sbg.mag.magnetometers[2]);
+                cached.sensors.mag_data.field = Vector3f(cached.sbg.mag.magnetometers[0], cached.sbg.mag.magnetometers[1], cached.sbg.mag.magnetometers[2]) * 1000.0f;
                 updated_mag = true;
                 break;
 
@@ -743,7 +743,7 @@ bool AP_ExternalAHRS_SBG::send_MagData(AP_HAL::UARTDriver *_uart)
     if (compass.available() || compass.healthy()) {
         // TODO: consider also checking compass.last_update_usec() to only send when we have new data
 
-        const Vector3f mag_field = compass.get_field();
+        const Vector3f mag_field = compass.get_field() * 0.001f;
         mag_data_log.magnetometers[0] = mag_field[0];
         mag_data_log.magnetometers[1] = mag_field[1];
         mag_data_log.magnetometers[2] = mag_field[2];
