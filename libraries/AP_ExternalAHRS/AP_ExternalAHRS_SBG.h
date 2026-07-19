@@ -178,7 +178,8 @@ private:
     uint32_t send_AirData_ms;
     uint32_t send_mag_error_last_ms;
     uint32_t send_air_error_last_ms;
-    static bool send_MagData(AP_HAL::UARTDriver *_uart);
+    uint32_t last_mag_uplink_usec;
+    bool send_MagData(AP_HAL::UARTDriver *_uart);
     static bool send_AirData(AP_HAL::UARTDriver *_uart);
 
     AP_HAL::UARTDriver *uart;

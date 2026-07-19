@@ -878,15 +878,20 @@ bool AP_ExternalAHRS_SBG::send_MagData(AP_HAL::UARTDriver *_uart)
     mag_data_log.timeStamp = AP_HAL::micros();
 
     const auto &compass = AP::compass();
-    if (compass.available() || compass.healthy()) {
-        // TODO: consider also checking compass.last_update_usec() to only send when we have new data
+    if (compass.available() && compass.healthy()) {
+        const uint32_t mag_usec = compass.last_update_usec();
+        if (mag_usec == last_mag_uplink_usec) {
+            // no new sample, an accel only packet is useless to the unit
+            return true;
+        }
+        last_mag_uplink_usec = mag_usec;
 
         const Vector3f mag_field = compass.get_field() * 0.001f;
         mag_data_log.magnetometers[0] = mag_field[0];
         mag_data_log.magnetometers[1] = mag_field[1];
         mag_data_log.magnetometers[2] = mag_field[2];
 
-        mag_data_log.status |= (SBG_ECOM_MAG_MAG_X_BIT | SBG_ECOM_MAG_MAG_Y_BIT | SBG_ECOM_MAG_MAG_Z_BIT | SBG_ECOM_MAG_MAGS_IN_RANGE | SBG_ECOM_MAG_CALIBRATION_OK);
+        mag_data_log.status |= (SBG_ECOM_MAG_MAG_X_BIT | SBG_ECOM_MAG_MAG_Y_BIT | SBG_ECOM_MAG_MAG_Z_BIT | SBG_ECOM_MAG_MAGS_IN_RANGE);
     }
 
     const auto &ins = AP::ins();
