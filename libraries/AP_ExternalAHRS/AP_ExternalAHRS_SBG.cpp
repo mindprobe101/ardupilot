@@ -37,6 +37,7 @@
 #include <AP_GPS/AP_GPS.h>
 #include <AP_Airspeed/AP_Airspeed.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
+#include <AP_Logger/AP_Logger.h>
 
 extern const AP_HAL::HAL &hal;
 
@@ -532,6 +533,37 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                         updated_gps = true;
                     }
                 }
+
+#if HAL_LOGGING_ENABLED
+                if (now_ms - last_sbge_log_ms >= 100) {
+                    last_sbge_log_ms = now_ms;
+
+                    // @LoggerMessage: SBGE
+                    // @Description: SBG INS EKF solution status
+                    // @Field: TimeUS: Time since system startup
+                    // @Field: Mode: EKF solution mode, 4 is full navigation
+                    // @Field: Stat: raw EKF solution status bits
+                    // @Field: NSat: satellites used by the INS
+                    // @Field: Fix: GPS fix type reported to the flight controller
+                    // @Field: PErrH: horizontal position 1 sigma error
+                    // @Field: PErrV: vertical position 1 sigma error
+                    // @Field: VErr: horizontal velocity 1 sigma error
+                    // @Field: YErr: yaw 1 sigma error, needs the EKF euler log enabled
+                    AP::logger().WriteStreaming("SBGE", "TimeUS,Mode,Stat,NSat,Fix,PErrH,PErrV,VErr,YErr",
+                                                "s----mmnd",
+                                                "F--------",
+                                                "QBIBBffff",
+                                                AP_HAL::micros64(),
+                                                SbgEkfStatus_solution_mode(cached.sbg.ekfNav.status),
+                                                cached.sbg.ekfNav.status,
+                                                cached.sbg.gnssPos.numSvUsed,
+                                                (uint8_t)cached.sensors.gps_data.fix_type,
+                                                Vector2f(cached.sbg.ekfNav.positionStdDev[0], cached.sbg.ekfNav.positionStdDev[1]).length(),
+                                                cached.sbg.ekfNav.positionStdDev[2],
+                                                Vector2f(cached.sbg.ekfNav.velocityStdDev[0], cached.sbg.ekfNav.velocityStdDev[1]).length(),
+                                                degrees(cached.sbg.ekfEuler.eulerStdDev[2]));
+                }
+#endif // HAL_LOGGING_ENABLED
                 break;
 
             case SBG_ECOM_LOG_GPS1_VEL: // 13

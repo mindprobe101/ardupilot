@@ -163,6 +163,7 @@ private:
     bool ekf_solution_valid = false;
     uint32_t last_ekf_nav_ms;
     uint32_t last_att_ms;
+    uint32_t last_sbge_log_ms;
     bool gps_fix_is_from_ekf;
     static uint8_t SbgEkfStatus_solution_mode(const uint32_t ekfStatus);
     bool SbgEkfNav_solution_valid(const SbgEComLogEkfNav &nav) const;
