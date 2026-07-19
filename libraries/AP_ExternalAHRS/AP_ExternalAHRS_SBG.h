@@ -165,6 +165,10 @@ private:
     uint32_t last_att_ms;
     uint32_t last_sbge_log_ms;
     bool gps_fix_is_from_ekf;
+    uint8_t last_reported_sol_mode = 255;
+    bool last_reported_gps_pos_used;
+    uint32_t last_mode_msg_ms;
+    uint32_t last_aiding_msg_ms;
     static uint8_t SbgEkfStatus_solution_mode(const uint32_t ekfStatus);
     bool SbgEkfNav_solution_valid(const SbgEComLogEkfNav &nav) const;
 

@@ -368,6 +368,8 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
     bool updated_ins = false;
     bool updated_mag = false;
     bool updated_airspeed = false;
+    int16_t announce_mode = -1;
+    int8_t announce_pos_used = -1;
 
     {
         WITH_SEMAPHORE(state.sem);
@@ -483,6 +485,25 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
 
                 ekf_solution_valid = SbgEkfNav_solution_valid(cached.sbg.ekfNav);
                 last_ekf_nav_ms = now_ms;
+
+                // report solution mode and position aiding changes to the
+                // operator, messages go out after the semaphore is released
+                if (now_ms - last_mode_msg_ms >= 5000) {
+                    const uint8_t sol_mode = SbgEkfStatus_solution_mode(cached.sbg.ekfNav.status);
+                    if (sol_mode != last_reported_sol_mode) {
+                        last_reported_sol_mode = sol_mode;
+                        last_mode_msg_ms = now_ms;
+                        announce_mode = sol_mode;
+                    }
+                }
+                if (now_ms - last_aiding_msg_ms >= 5000) {
+                    const bool pos_used = (cached.sbg.ekfNav.status & SBG_ECOM_SOL_GPS1_POS_USED) != 0;
+                    if (pos_used != last_reported_gps_pos_used) {
+                        last_reported_gps_pos_used = pos_used;
+                        last_aiding_msg_ms = now_ms;
+                        announce_pos_used = pos_used ? 1 : 0;
+                    }
+                }
 
                 if (ekf_solution_valid) {
                     state.velocity = Vector3f(cached.sbg.ekfNav.velocity[0], cached.sbg.ekfNav.velocity[1], cached.sbg.ekfNav.velocity[2]);
@@ -636,6 +657,19 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
         } // switch msgid
     } // semaphore
 
+    if (announce_mode >= 0) {
+        if (announce_mode == SBG_ECOM_SOL_MODE_NAV_POSITION) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: EKF full navigation");
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: EKF nav degraded (mode %u)", (unsigned)announce_mode);
+        }
+    }
+    if (announce_pos_used == 1) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: GNSS position used");
+    } else if (announce_pos_used == 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS position rejected");
+    }
+
 #if AP_GPS_ENABLED
     if (updated_gps) {
         cached.sensors.gps_ms = now_ms;
@@ -758,18 +792,27 @@ AP_GPS_FixType AP_ExternalAHRS_SBG::SbgGpsPosStatus_to_GpsFixType(const uint32_t
 
 void AP_ExternalAHRS_SBG::update()
 {
-    WITH_SEMAPHORE(state.sem);
+    bool nav_data_lost = false;
 
-    // the EKF_NAV stream is the source of the reported GPS fix, if it stops
-    // while we still claim a valid solution the claim has to be withdrawn.
-    // the UTC time handler keeps pushing the cached GPS data so a stale fix
-    // would otherwise never time out on the AP_GPS side
-    if (ekf_solution_valid && last_ekf_nav_ms != 0 &&
-        AP_HAL::millis() - last_ekf_nav_ms > SBG_EKF_NAV_TIMEOUT_MS) {
-        ekf_solution_valid = false;
-        if (gps_fix_is_from_ekf) {
-            cached.sensors.gps_data.fix_type = AP_GPS_FixType::NONE;
+    {
+        WITH_SEMAPHORE(state.sem);
+
+        // the EKF_NAV stream is the source of the reported GPS fix, if it stops
+        // while we still claim a valid solution the claim has to be withdrawn.
+        // the UTC time handler keeps pushing the cached GPS data so a stale fix
+        // would otherwise never time out on the AP_GPS side
+        if (ekf_solution_valid && last_ekf_nav_ms != 0 &&
+            AP_HAL::millis() - last_ekf_nav_ms > SBG_EKF_NAV_TIMEOUT_MS) {
+            ekf_solution_valid = false;
+            if (gps_fix_is_from_ekf) {
+                cached.sensors.gps_data.fix_type = AP_GPS_FixType::NONE;
+            }
+            nav_data_lost = true;
         }
+    }
+
+    if (nav_data_lost) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: EKF nav data lost");
     }
 }
 
