@@ -100,4 +100,10 @@ BOARD_VALIDATE $CHECK_IMU0_PRESENT $CHECK_IMU1_PRESENT $CHECK_IMU2_PRESENT $CHEC
 env BUILD_ABIN True
 define HAL_INS_HIGHRES_SAMPLE 6
 
+# This target is the SBG ExternalAHRS variant. Keep only the SBG backend in
+# internal flash; the PPP networking backend below remains enabled.
+define HAL_EXTERNAL_AHRS_ENABLED 1
+define AP_EXTERNAL_AHRS_BACKEND_DEFAULT_ENABLED 0
+define AP_EXTERNAL_AHRS_SBG_ENABLED 1
+
 define AP_NETWORKING_BACKEND_PPP 1

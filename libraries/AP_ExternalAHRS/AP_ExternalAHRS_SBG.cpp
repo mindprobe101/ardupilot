@@ -31,6 +31,7 @@
 #include <AP_Common/time.h>
 #include <AP_Compass/AP_Compass.h>
 #include <AP_InertialSensor/AP_InertialSensor.h>
+#include <AP_Logger/AP_Logger.h>
 #include <GCS_MAVLink/GCS.h>
 #include <AP_SerialManager/AP_SerialManager.h>
 #include <AP_RTC/AP_RTC.h>
@@ -40,11 +41,37 @@
 
 extern const AP_HAL::HAL &hal;
 
+constexpr uint8_t AP_ExternalAHRS_SBG::SBG_PACKET_SYNC1;
+constexpr uint8_t AP_ExternalAHRS_SBG::SBG_PACKET_SYNC2;
+constexpr uint8_t AP_ExternalAHRS_SBG::SBG_PACKET_ETX;
+constexpr uint16_t AP_ExternalAHRS_SBG::SBG_PACKET_PAYLOAD_SIZE_MAX;
+constexpr uint16_t AP_ExternalAHRS_SBG::SBG_PACKET_OVERHEAD;
+
+AP_ExternalAHRS_SBG::sbgMessage::sbgMessage(const uint8_t msgClass_, const uint8_t msgId_) :
+    msgid(msgId_),
+    msgclass(msgClass_)
+{
+}
+
+AP_ExternalAHRS_SBG::sbgMessage::sbgMessage(const uint8_t msgClass_, const uint8_t msgId_,
+                                            const uint8_t *payload, const uint16_t payload_len) :
+    msgid(msgId_),
+    msgclass(msgClass_)
+{
+    if (payload != nullptr && payload_len <= sizeof(data)) {
+        memcpy(data, payload, payload_len);
+        len = payload_len;
+    }
+}
+
 // constructor
 AP_ExternalAHRS_SBG::AP_ExternalAHRS_SBG(AP_ExternalAHRS *_frontend,
                                                            AP_ExternalAHRS::state_t &_state) :
     AP_ExternalAHRS_backend(_frontend, _state)
 {
+    initialise_gnss_pos(cached.sbg.gnssPos);
+    initialise_utc(cached.sbg.utc);
+
     auto &sm = AP::serialmanager();
     uart = sm.find_serial(AP_SerialManager::SerialProtocol_AHRS, 0);
     if (uart == nullptr) {
@@ -83,17 +110,13 @@ void AP_ExternalAHRS_SBG::update_thread()
     setup_complete = true;
 
     while (true) {
-        
-        if (check_uart()) {
-            // we've parsed something. There might be more so lets come back quickly
-            hal.scheduler->delay_microseconds(100);
-            continue;
+        const bool received_data = check_uart();
+        hal.scheduler->delay_microseconds(received_data ? 100 : 250);
+        const uint32_t now_ms = AP_HAL::millis();
+        if (option_is_set(AP_ExternalAHRS::OPTIONS::SBG_EKF_AS_GNSS)) {
+            publish_ekf_gps(now_ms);
         }
 
-        // uart is idle, lets snooze a little more and then do some housekeeping
-        hal.scheduler->delay_microseconds(250);
-
-        const uint32_t now_ms = AP_HAL::millis();
         if (cached.sbg.deviceInfo.firmwareRev == 0 && now_ms - version_check_ms >= 5000) {
             // request Device Info every few seconds until we get a response
             version_check_ms = now_ms;
@@ -172,8 +195,8 @@ bool AP_ExternalAHRS_SBG::send_sbgMessage(AP_HAL::UARTDriver *_uart, const sbgMe
         return false;
     }
 
-    const uint16_t buffer_len = (SBG_PACKET_OVERHEAD + msg.len);
-    uint8_t buffer[buffer_len];
+    const uint16_t buffer_len = SBG_PACKET_OVERHEAD + msg.len;
+    uint8_t buffer[SBG_PACKET_OVERHEAD + SBG_PACKET_PAYLOAD_SIZE_MAX];
 
     buffer[0] = SBG_PACKET_SYNC1;
     buffer[1] = SBG_PACKET_SYNC2;
@@ -200,117 +223,369 @@ bool AP_ExternalAHRS_SBG::send_sbgMessage(AP_HAL::UARTDriver *_uart, const sbgMe
 bool AP_ExternalAHRS_SBG::parse_byte(const uint8_t data, sbgMessage &msg, SBG_PACKET_INBOUND_STATE &inbound_state)
 {
     switch (inbound_state.parser) {
-        case SBG_PACKET_PARSE_STATE::SYNC1:
+    case SBG_PACKET_PARSE_STATE::SYNC1:
+        inbound_state.parser = (data == SBG_PACKET_SYNC1) ? SBG_PACKET_PARSE_STATE::SYNC2 : SBG_PACKET_PARSE_STATE::SYNC1;
+        break;
+
+    case SBG_PACKET_PARSE_STATE::SYNC2:
+        if (data == SBG_PACKET_SYNC2) {
+            inbound_state.parser = SBG_PACKET_PARSE_STATE::MSG;
+        } else {
             inbound_state.parser = (data == SBG_PACKET_SYNC1) ? SBG_PACKET_PARSE_STATE::SYNC2 : SBG_PACKET_PARSE_STATE::SYNC1;
-            break;
-            
-        case SBG_PACKET_PARSE_STATE::SYNC2:
-            inbound_state.parser = (data == SBG_PACKET_SYNC2) ? SBG_PACKET_PARSE_STATE::MSG : SBG_PACKET_PARSE_STATE::SYNC1;
-            break;
+        }
+        break;
 
-        case SBG_PACKET_PARSE_STATE::MSG:
-            msg.msgid = data;
-            inbound_state.parser = SBG_PACKET_PARSE_STATE::CLASS;
-            break;
+    case SBG_PACKET_PARSE_STATE::MSG:
+        msg.msgid = data;
+        inbound_state.parser = SBG_PACKET_PARSE_STATE::CLASS;
+        break;
 
-        case SBG_PACKET_PARSE_STATE::CLASS:
-            msg.msgclass = data;
-            inbound_state.parser = SBG_PACKET_PARSE_STATE::LEN1;
-            break;
+    case SBG_PACKET_PARSE_STATE::CLASS:
+        msg.msgclass = data;
+        inbound_state.parser = SBG_PACKET_PARSE_STATE::LEN1;
+        break;
 
-        case SBG_PACKET_PARSE_STATE::LEN1:
-            msg.len = data;
-            inbound_state.parser = SBG_PACKET_PARSE_STATE::LEN2;
-            break;
+    case SBG_PACKET_PARSE_STATE::LEN1:
+        msg.len = data;
+        inbound_state.parser = SBG_PACKET_PARSE_STATE::LEN2;
+        break;
 
-        case SBG_PACKET_PARSE_STATE::LEN2:
-            msg.len |= uint16_t(data) << 8;
-            if (msg.len > sizeof(msg.data)) {
-                // we can't handle this packet, it's larger than the rx buffer which is larger than the largest packet we care about
-                inbound_state.data_count_skip = msg.len;
-                inbound_state.parser = SBG_PACKET_PARSE_STATE::DROP_THIS_PACKET;
-            } else {
-                inbound_state.data_count = 0;
-                inbound_state.parser = (msg.len > 0) ? SBG_PACKET_PARSE_STATE::DATA : SBG_PACKET_PARSE_STATE::CRC1;
-            }
-            break;
+    case SBG_PACKET_PARSE_STATE::LEN2:
+        msg.len |= uint16_t(data) << 8;
+        inbound_state.data_count = 0;
+        if (msg.len > sizeof(msg.data)) {
+            // Drop the payload, CRC and ETX. The next byte is then a possible SYNC1.
+            inbound_state.data_count_skip = uint32_t(msg.len) + 3U;
+            inbound_state.parser = SBG_PACKET_PARSE_STATE::DROP_THIS_PACKET;
+        } else {
+            inbound_state.parser = (msg.len == 0) ? SBG_PACKET_PARSE_STATE::CRC1 : SBG_PACKET_PARSE_STATE::DATA;
+        }
+        break;
 
-        case SBG_PACKET_PARSE_STATE::DATA:
-            msg.data[inbound_state.data_count++] = data;
-            if (inbound_state.data_count >= sizeof(msg.data)) {
-                inbound_state.parser = SBG_PACKET_PARSE_STATE::SYNC1;
-            } else if (inbound_state.data_count >= msg.len) {
-                inbound_state.parser = SBG_PACKET_PARSE_STATE::CRC1;
-            }
-            break;
+    case SBG_PACKET_PARSE_STATE::DATA:
+        msg.data[inbound_state.data_count++] = data;
+        if (inbound_state.data_count == msg.len) {
+            inbound_state.parser = SBG_PACKET_PARSE_STATE::CRC1;
+        }
+        break;
 
-        case SBG_PACKET_PARSE_STATE::CRC1:
-            inbound_state.crc = data;
-            inbound_state.parser = SBG_PACKET_PARSE_STATE::CRC2;
-            break;
+    case SBG_PACKET_PARSE_STATE::CRC1:
+        inbound_state.crc = data;
+        inbound_state.parser = SBG_PACKET_PARSE_STATE::CRC2;
+        break;
 
-        case SBG_PACKET_PARSE_STATE::CRC2:
-            inbound_state.crc |= uint16_t(data) << 8;
-            inbound_state.parser = SBG_PACKET_PARSE_STATE::SYNC1; // skip ETX and go directly to SYNC1. Do not pass Go.
-            {
-                // CRC field is computed on [MSG(1), CLASS(1), LEN(2), DATA(msg.len)] fields
-                const uint16_t crc = crc16_ccitt_r((const uint8_t*)&msg, msg.len+4, 0, 0);
-                if (crc == inbound_state.crc) {
-                    return true;
-                }
-                // GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: Failed CRC. Received 0x%04X, Expected 0x%04X", (unsigned)inbound_state.crc, (unsigned)crc);
-            }
-            break;
+    case SBG_PACKET_PARSE_STATE::CRC2:
+        inbound_state.crc |= uint16_t(data) << 8;
+        inbound_state.crc_valid = crc16_ccitt_r((const uint8_t *)&msg, msg.len + 4, 0, 0) == inbound_state.crc;
+        inbound_state.parser = SBG_PACKET_PARSE_STATE::ETX;
+        break;
 
-        case SBG_PACKET_PARSE_STATE::ETX:
-        // we can just skip this state and let SYNC1 fail once when it gets the ETX byte every time... same amount of work
+    case SBG_PACKET_PARSE_STATE::ETX: {
+        const bool packet_valid = inbound_state.crc_valid && data == SBG_PACKET_ETX;
+        inbound_state.parser = (data == SBG_PACKET_SYNC1 && !packet_valid) ?
+            SBG_PACKET_PARSE_STATE::SYNC2 : SBG_PACKET_PARSE_STATE::SYNC1;
+        return packet_valid;
+    }
+
+    case SBG_PACKET_PARSE_STATE::DROP_THIS_PACKET:
+        if (inbound_state.data_count_skip > 0) {
+            inbound_state.data_count_skip--;
+        }
+        if (inbound_state.data_count_skip == 0) {
             inbound_state.parser = SBG_PACKET_PARSE_STATE::SYNC1;
-            break;
-
-        default:
-        case SBG_PACKET_PARSE_STATE::DROP_THIS_PACKET:
-            // we're currently parsing a packet that is very large and is not one we care
-            // about. This is not the packet you're looking for... drop all those bytes
-            if (inbound_state.data_count_skip > 0) {
-                inbound_state.data_count_skip--;
-            }
-            if (inbound_state.data_count_skip == 0) {
-                inbound_state.parser = SBG_PACKET_PARSE_STATE::SYNC1;
-            }
-            break;
+        }
+        break;
     }
 
     return false;
 }
 
-uint16_t AP_ExternalAHRS_SBG::make_gps_week(const SbgEComLogUtc *utc_data)
+bool AP_ExternalAHRS_SBG::payload_length_valid(const uint8_t msgclass, const uint8_t msgid, const uint16_t payload_len)
 {
+    uint16_t minimum_length = 0;
+
+    if (msgclass == SBG_ECOM_CLASS_LOG_CMD_0) {
+        switch ((SbgEComCmd)msgid) {
+        case SBG_ECOM_CMD_ACK:
+            minimum_length = sizeof(SbgEComAck);
+            break;
+        case SBG_ECOM_CMD_INFO:
+            minimum_length = sizeof(SbgEComDeviceInfo);
+            break;
+        default:
+            return false;
+        }
+    } else if (msgclass == SBG_ECOM_CLASS_LOG_ECOM_1) {
+        if (msgid != SBG_ECOM_LOG_FAST_IMU_DATA) {
+            return false;
+        }
+        minimum_length = sizeof(SbgEComLogImuFastLegacy);
+    } else if (msgclass == SBG_ECOM_CLASS_LOG_ECOM_0) {
+        switch ((SbgEComLog)msgid) {
+        case SBG_ECOM_LOG_STATUS:
+            minimum_length = 22;
+            break;
+        case SBG_ECOM_LOG_UTC_TIME:
+            minimum_length = 21;
+            break;
+        case SBG_ECOM_LOG_IMU_DATA:
+            minimum_length = sizeof(SbgEComLogImuLegacy);
+            break;
+        case SBG_ECOM_LOG_MAG:
+            minimum_length = sizeof(SbgEComLogMag);
+            break;
+        case SBG_ECOM_LOG_EKF_EULER:
+            minimum_length = sizeof(SbgEComLogEkfEuler);
+            break;
+        case SBG_ECOM_LOG_EKF_QUAT:
+            minimum_length = sizeof(SbgEComLogEkfQuat);
+            break;
+        case SBG_ECOM_LOG_EKF_NAV:
+            minimum_length = sizeof(SbgEComLogEkfNav);
+            break;
+        case SBG_ECOM_LOG_GPS1_VEL:
+        case SBG_ECOM_LOG_GPS2_VEL:
+            minimum_length = sizeof(SbgEComLogGnssVel);
+            break;
+        case SBG_ECOM_LOG_GPS1_POS:
+        case SBG_ECOM_LOG_GPS2_POS:
+            minimum_length = 52;
+            break;
+        case SBG_ECOM_LOG_AIR_DATA:
+            minimum_length = sizeof(SbgEComLogAirData);
+            break;
+        case SBG_ECOM_LOG_IMU_SHORT:
+            minimum_length = sizeof(SbgEComLogImuShort);
+            break;
+        default:
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    return payload_len >= minimum_length;
+}
+
+void AP_ExternalAHRS_SBG::initialise_gnss_pos(SbgEComLogGnssPos &gnss_pos)
+{
+    memset(&gnss_pos, 0, sizeof(gnss_pos));
+    gnss_pos.latitudeAccuracy = 9999.0f;
+    gnss_pos.longitudeAccuracy = 9999.0f;
+    gnss_pos.altitudeAccuracy = 9999.0f;
+    gnss_pos.numSvUsed = UINT8_MAX;
+    gnss_pos.numSvTracked = UINT8_MAX;
+    gnss_pos.baseStationId = UINT16_MAX;
+    gnss_pos.differentialAge = UINT16_MAX;
+    gnss_pos.statusExt = uint32_t(SBG_ECOM_GNSS_IFM_STATUS_UNKNOWN) |
+                         (uint32_t(SBG_ECOM_GNSS_SPOOFING_STATUS_UNKNOWN) << SBG_ECOM_GPS_POS_SPOOFING_SHIFT) |
+                         (uint32_t(SBG_ECOM_GNSS_OSNMA_STATUS_DISABLED) << SBG_ECOM_GPS_POS_OSNMA_SHIFT);
+    gnss_pos.upTime = UINT32_MAX;
+}
+
+void AP_ExternalAHRS_SBG::initialise_utc(SbgEComLogUtc &utc)
+{
+    memset(&utc, 0, sizeof(utc));
+    utc.clkBiasStd = NAN;
+    utc.clkSfErrorStd = NAN;
+    utc.clkResidualError = NAN;
+}
+
+bool AP_ExternalAHRS_SBG::make_gps_week(const SbgEComLogUtc &utc_data, uint16_t &gps_week)
+{
+    static const uint8_t days_in_month[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    const bool leap_year = (utc_data.year % 4U == 0U && utc_data.year % 100U != 0U) ||
+                           utc_data.year % 400U == 0U;
+    const uint8_t max_day = utc_data.month == 2 ? days_in_month[1] + uint8_t(leap_year) :
+                                                  days_in_month[utc_data.month > 0 && utc_data.month <= 12 ? utc_data.month - 1 : 0];
+    if (utc_data.year < 1980 || utc_data.month < 1 || utc_data.month > 12 ||
+        utc_data.day < 1 || utc_data.day > max_day || utc_data.hour < 0 || utc_data.hour > 23 ||
+        utc_data.minute < 0 || utc_data.minute > 59 || utc_data.second < 0 || utc_data.second > 60 ||
+        utc_data.nanoSecond <= -1000000000 || utc_data.nanoSecond >= 1000000000 ||
+        utc_data.gpsTimeOfWeek >= AP_MSEC_PER_WEEK) {
+        return false;
+    }
+
     const struct tm tm {
-        .tm_sec = utc_data->second,
-        .tm_min = utc_data->minute,
-        .tm_hour = utc_data->hour,
-        .tm_mday = utc_data->day,
-        .tm_mon  = utc_data->month - 1,
-        .tm_year = utc_data->year - 1900,
+        .tm_sec = MIN(utc_data.second, 59),
+        .tm_min = utc_data.minute,
+        .tm_hour = utc_data.hour,
+        .tm_mday = utc_data.day,
+        .tm_mon = utc_data.month - 1,
+        .tm_year = utc_data.year - 1900,
     };
+    const int64_t unix_ms = int64_t(ap_mktime(&tm)) * AP_MSEC_PER_SEC +
+                            utc_data.nanoSecond / 1000000 +
+                            ((utc_data.second == 60) ? AP_MSEC_PER_SEC : 0);
+    const int64_t gps_epoch_ms = unix_ms - int64_t(UNIX_OFFSET_MSEC);
+    if (gps_epoch_ms < 0) {
+        return false;
+    }
 
+    int64_t week = gps_epoch_ms / int64_t(AP_MSEC_PER_WEEK);
+    const int64_t calendar_tow = gps_epoch_ms % int64_t(AP_MSEC_PER_WEEK);
+    const int64_t reported_tow = utc_data.gpsTimeOfWeek;
+    if (reported_tow - calendar_tow > int64_t(AP_MSEC_PER_WEEK / 2)) {
+        week--;
+    } else if (calendar_tow - reported_tow > int64_t(AP_MSEC_PER_WEEK / 2)) {
+        week++;
+    }
+    if (week <= 0 || week > UINT16_MAX) {
+        return false;
+    }
+    gps_week = uint16_t(week);
+    return true;
+}
 
-    // convert from time structure to unix time
-    const time_t unix_time = ap_mktime(&tm);
+bool AP_ExternalAHRS_SBG::extrapolate_gps_time(const TimeAnchor &anchor, const uint32_t sbg_timestamp,
+                                               uint16_t &gps_week, uint32_t &tow_ms)
+{
+    if (!anchor.valid || anchor.week == 0 || anchor.tow_ms >= AP_MSEC_PER_WEEK) {
+        gps_week = 0;
+        tow_ms = 0;
+        return false;
+    }
 
-    // convert to time since GPS epoch
-    const uint32_t gps_time = unix_time - ((utc_data->gpsTimeOfWeek + UNIX_OFFSET_MSEC) / 1000);
+    const int32_t delta_us = int32_t(sbg_timestamp - anchor.sbg_timestamp);
+    int64_t extrapolated_tow = int64_t(anchor.tow_ms) + delta_us / 1000;
+    int32_t week = anchor.week;
+    while (extrapolated_tow < 0) {
+        extrapolated_tow += AP_MSEC_PER_WEEK;
+        week--;
+    }
+    while (extrapolated_tow >= int64_t(AP_MSEC_PER_WEEK)) {
+        extrapolated_tow -= AP_MSEC_PER_WEEK;
+        week++;
+    }
+    if (week <= 0 || week > UINT16_MAX) {
+        gps_week = 0;
+        tow_ms = 0;
+        return false;
+    }
+    gps_week = uint16_t(week);
+    tow_ms = uint32_t(extrapolated_tow);
+    return true;
+}
 
-    // get GPS week
-    const uint16_t gps_week = gps_time / AP_SEC_PER_WEEK;
+bool AP_ExternalAHRS_SBG::utc_anchor_valid(const SbgEComLogUtc &utc)
+{
+    const SbgEComClockStatus clock_status = sbgEComLogUtcGetClockStatus(utc.status);
+    uint16_t week;
+    return clock_status != SBG_ECOM_CLOCK_ERROR &&
+           sbgEComLogUtcGetClockUtcStatus(utc.status) == SBG_ECOM_UTC_VALID &&
+           make_gps_week(utc, week);
+}
 
-    return gps_week;
+AP_ExternalAHRS_SBG::MessageFreshness AP_ExternalAHRS_SBG::message_freshness(
+    const ReceiveTimes &times, const uint32_t now_ms)
+{
+    return {
+        times.ekf_nav_ms != 0 && now_ms - times.ekf_nav_ms <= EKF_NAV_TIMEOUT_MS,
+        times.gps_pos_ms != 0 && now_ms - times.gps_pos_ms <= GNSS_TIMEOUT_MS,
+        times.gps_vel_ms != 0 && now_ms - times.gps_vel_ms <= GNSS_TIMEOUT_MS,
+        times.utc_ms != 0 && now_ms - times.utc_ms <= UTC_TIMEOUT_MS,
+        times.status_ms != 0 && now_ms - times.status_ms <= STATUS_TIMEOUT_MS,
+    };
+}
+
+AP_ExternalAHRS_SBG::NavigationState AP_ExternalAHRS_SBG::navigation_state(
+    const SbgEComLogEkfNav &ekf_nav, const bool nav_fresh, const bool disabled,
+    float &horizontal_accuracy, float &speed_accuracy)
+{
+    horizontal_accuracy = NAN;
+    speed_accuracy = NAN;
+    if (disabled) {
+        return NavigationState::ADMIN_DISABLED;
+    }
+    if (!nav_fresh) {
+        return NavigationState::STALE;
+    }
+
+    const auto solution_mode = SbgEComSolutionMode(ekf_nav.status & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK);
+    if (solution_mode != SBG_ECOM_SOL_MODE_NAV_POSITION) {
+        return NavigationState::NO_NAVIGATION;
+    }
+    if ((ekf_nav.status & (SBG_ECOM_SOL_POSITION_VALID | SBG_ECOM_SOL_VELOCITY_VALID)) !=
+        (SBG_ECOM_SOL_POSITION_VALID | SBG_ECOM_SOL_VELOCITY_VALID)) {
+        return NavigationState::INVALID_NAVIGATION;
+    }
+
+    for (uint8_t i = 0; i < 3; i++) {
+        if (!isfinite(ekf_nav.velocity[i]) || !isfinite(ekf_nav.velocityStdDev[i]) ||
+            is_negative(ekf_nav.velocityStdDev[i]) || !isfinite(ekf_nav.position[i]) ||
+            !isfinite(ekf_nav.positionStdDev[i]) || is_negative(ekf_nav.positionStdDev[i])) {
+            return NavigationState::INVALID_NAVIGATION;
+        }
+    }
+    if (fabs(ekf_nav.position[0]) > 90.0 || fabs(ekf_nav.position[1]) > 180.0 ||
+        fabs(ekf_nav.position[2]) > 1000000.0) {
+        return NavigationState::INVALID_NAVIGATION;
+    }
+
+    horizontal_accuracy = safe_sqrt(sq(ekf_nav.positionStdDev[0]) + sq(ekf_nav.positionStdDev[1]));
+    speed_accuracy = safe_sqrt(sq(ekf_nav.velocityStdDev[0]) + sq(ekf_nav.velocityStdDev[1]) +
+                               sq(ekf_nav.velocityStdDev[2]));
+    if (!isfinite(horizontal_accuracy) || horizontal_accuracy >= 100.0f || !isfinite(speed_accuracy)) {
+        return NavigationState::INVALID_NAVIGATION;
+    }
+    return (ekf_nav.status & SBG_ECOM_SOL_GPS1_POS_USED) ? NavigationState::GNSS_AIDED : NavigationState::INERTIAL;
+}
+
+AP_GPS_FixType AP_ExternalAHRS_SBG::accuracy_to_fix(const float horizontal_accuracy)
+{
+    if (!isfinite(horizontal_accuracy) || is_negative(horizontal_accuracy) || horizontal_accuracy >= 100.0f) {
+        return AP_GPS_FixType::NONE;
+    }
+    if (horizontal_accuracy < 0.10f) {
+        return AP_GPS_FixType::RTK_FIXED;
+    }
+    if (horizontal_accuracy < 0.30f) {
+        return AP_GPS_FixType::RTK_FLOAT;
+    }
+    if (horizontal_accuracy < 1.20f) {
+        return AP_GPS_FixType::DGPS;
+    }
+    return AP_GPS_FixType::FIX_3D;
+}
+
+AP_GPS_FixType AP_ExternalAHRS_SBG::navigation_fix(const NavigationState nav_state,
+                                                   const SbgEComLogEkfNav &ekf_nav,
+                                                   const SbgEComLogGnssPos &gnss_pos,
+                                                   const bool gnss_pos_fresh,
+                                                   const bool gnss_vel_fresh,
+                                                   const float horizontal_accuracy)
+{
+    if (nav_state != NavigationState::INERTIAL && nav_state != NavigationState::GNSS_AIDED) {
+        return AP_GPS_FixType::NONE;
+    }
+
+    const uint8_t ifm = (gnss_pos.statusExt >> SBG_ECOM_GPS_POS_IFM_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t spoofing = (gnss_pos.statusExt >> SBG_ECOM_GPS_POS_SPOOFING_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t osnma = (gnss_pos.statusExt >> SBG_ECOM_GPS_POS_OSNMA_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const bool unsafe_gnss = ifm == SBG_ECOM_GNSS_IFM_STATUS_CRITICAL ||
+                             spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_SINGLE ||
+                             spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_MULTIPLE ||
+                             osnma == SBG_ECOM_GNSS_OSNMA_STATUS_SPOOFED;
+    const uint8_t position_status = (gnss_pos.status >> SBG_ECOM_GPS_POS_STATUS_SHIFT) & SBG_ECOM_GPS_POS_STATUS_MASK;
+    const AP_GPS_FixType raw_fix = gps_position_type_to_fix(gnss_pos.status);
+    const bool trusted_classification = nav_state == NavigationState::GNSS_AIDED && gnss_pos_fresh && gnss_vel_fresh &&
+                                        (ekf_nav.status & SBG_ECOM_SOL_GPS1_POS_USED) &&
+                                        position_status == SBG_ECOM_GPS_POS_STATUS_SOL_COMPUTED &&
+                                        raw_fix >= AP_GPS_FixType::FIX_3D && !unsafe_gnss;
+    if (!trusted_classification) {
+        return AP_GPS_FixType::FIX_3D;
+    }
+    return MIN(raw_fix, accuracy_to_fix(horizontal_accuracy));
 }
 
 void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
 {
     const uint32_t now_ms = AP_HAL::millis();
     const bool valid_class1_msg = ((SbgEComClass)msg.msgclass == SBG_ECOM_CLASS_LOG_ECOM_1 && (_SbgEComLog1MsgId)msg.msgid == SBG_ECOM_LOG_FAST_IMU_DATA);
+
+    if (!payload_length_valid(msg.msgclass, msg.msgid, msg.len)) {
+        return;
+    }
 
     if ((SbgEComClass)msg.msgclass == SBG_ECOM_CLASS_LOG_CMD_0) {
         switch ((SbgEComCmd)msg.msgid) {
@@ -341,9 +616,6 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                                 (unsigned) (cached.sbg.deviceInfo.firmwareRev >> 22) & 0x003F,
                                 (unsigned)(cached.sbg.deviceInfo.firmwareRev >> 16) & 0x003F,
                                 (unsigned)cached.sbg.deviceInfo.firmwareRev & 0xFFFF);
-                break;
-
-                case SBG_ECOM_CMD_COMPUTE_MAG_CALIB: // 15
                 break;
 
             default:
@@ -381,46 +653,53 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                 break;
 
             case SBG_ECOM_LOG_UTC_TIME: // 2
-                safe_copy_msg_to_object((uint8_t*)&cached.sbg.utc, sizeof(cached.sbg.utc), msg.data, msg.len);
+                initialise_utc(cached.sbg.utc);
+                memcpy(&cached.sbg.utc, msg.data, MIN(sizeof(cached.sbg.utc), msg.len));
+                received.utc_ms = now_ms;
 
-                if (sbgEComLogUtcGetClockStatus(cached.sbg.utc.status)    != SBG_ECOM_CLOCK_VALID ||
-                    sbgEComLogUtcGetClockUtcStatus(cached.sbg.utc.status) != SBG_ECOM_UTC_VALID)
-                {
-                    // Data is not valid, ignore it.
-                    // This will happen even with a GPS fix = 3. A 3D lock is not enough, a valid
-                    // clock has a higher threshold of quiality needed. It also needs time to sync
-                    // its internal timing and PPS outputs before valid.
-                    break;
+                time_anchor.valid = utc_anchor_valid(cached.sbg.utc) &&
+                                    make_gps_week(cached.sbg.utc, time_anchor.week);
+                if (time_anchor.valid) {
+                    time_anchor.tow_ms = cached.sbg.utc.gpsTimeOfWeek;
+                    time_anchor.sbg_timestamp = cached.sbg.utc.timeStamp;
                 }
 
-                // GCS_SEND_TEXT(MAV_SEVERITY_INFO, "------------------");
-                // GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: %u-%u-%u %02u:%02u:%02u",
-                //     cached.sbg.utc.year,
-                //     (unsigned)cached.sbg.utc.month,
-                //     (unsigned)cached.sbg.utc.day,
-                //     (unsigned)cached.sbg.utc.hour,
-                //     (unsigned)cached.sbg.utc.minute,
-                //     (unsigned)cached.sbg.utc.second);
-
 #if AP_RTC_ENABLED
-                {
+                if (time_anchor.valid &&
+                    sbgEComLogUtcGetClockStatus(cached.sbg.utc.status) == SBG_ECOM_CLOCK_VALID &&
+                    (cached.sbg.utc.status & SBG_ECOM_CLOCK_UTC_IS_ACCURATE)) {
                     const uint32_t utc_epoch_sec = AP::rtc().date_fields_to_clock_s(
                         cached.sbg.utc.year,
                         cached.sbg.utc.month - 1,
                         cached.sbg.utc.day,
                         cached.sbg.utc.hour,
                         cached.sbg.utc.minute,
-                        cached.sbg.utc.second);
+                        MIN(cached.sbg.utc.second, 59));
 
-                    const uint64_t utc_epoch_usec = ((uint64_t)utc_epoch_sec) * 1E6 + (cached.sbg.utc.nanoSecond * 1E-3);
-                    AP::rtc().set_utc_usec(utc_epoch_usec, AP_RTC::SOURCE_GPS);
-
+                    const int64_t utc_epoch_usec = int64_t(utc_epoch_sec) * 1000000LL +
+                                                   cached.sbg.utc.nanoSecond / 1000 +
+                                                   (cached.sbg.utc.second == 60 ? 1000000LL : 0LL);
+                    if (utc_epoch_usec > 0) {
+                        AP::rtc().set_utc_usec(uint64_t(utc_epoch_usec), AP_RTC::SOURCE_GPS);
+                    }
                 }
 #endif // AP_RTC_ENABLED
 
-                cached.sensors.gps_data.ms_tow = cached.sbg.utc.gpsTimeOfWeek;
-                cached.sensors.gps_data.gps_week = make_gps_week(&cached.sbg.utc);
-                updated_gps = true;
+                if (!use_ekf_as_gnss && time_anchor.valid) {
+                    cached.sensors.gps_data.ms_tow = time_anchor.tow_ms;
+                    cached.sensors.gps_data.gps_week = time_anchor.week;
+                    updated_gps = true;
+                }
+                break;
+
+            case SBG_ECOM_LOG_STATUS:
+                memset(&cached.sbg.status, 0, sizeof(cached.sbg.status));
+                cached.sbg.status.cpuUsage = UINT8_MAX;
+                memcpy(&cached.sbg.status, msg.data, MIN(sizeof(cached.sbg.status), msg.len));
+                if (msg.len < 26) {
+                    cached.sbg.status.uptime = 0;
+                }
+                received.status_ms = now_ms;
                 break;
             
             case SBG_ECOM_LOG_IMU_SHORT: // 44
@@ -480,59 +759,49 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
 
             case SBG_ECOM_LOG_EKF_NAV: // 8
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.ekfNav, sizeof(cached.sbg.ekfNav), msg.data, msg.len);
+                received.ekf_nav_ms = now_ms;
 
-                state.velocity = Vector3f(cached.sbg.ekfNav.velocity[0], cached.sbg.ekfNav.velocity[1], cached.sbg.ekfNav.velocity[2]);
-                state.have_velocity = true;
-
-                state.location = Location(cached.sbg.ekfNav.position[0]*1e7, cached.sbg.ekfNav.position[1]*1e7, cached.sbg.ekfNav.position[2]*1e2, Location::AltFrame::ABSOLUTE);
-                state.last_location_update_us = AP_HAL::micros();
-
-                ekf_is_full_nav = SbgEkfStatus_is_fullNav(cached.sbg.ekfNav.status);
-
-                if (!state.have_location && ekf_is_full_nav) {
-                    state.have_location = true;
-                } else if (!state.have_origin && cached.sensors.gps_data.fix_type >= AP_GPS_FixType::FIX_3D && ekf_is_full_nav) {
-                    // this is in an else so that origin doesn't get set on the very very first sample, do it on the second one just to give us a tiny bit more chance of a better origin
-                    state.origin = state.location;
-                    state.have_origin = true;
-                }
-
-                if (ekf_is_full_nav && use_ekf_as_gnss) {
-                    cached.sensors.gps_data.latitude = cached.sbg.ekfNav.position[0] * 1E7;
-                    cached.sensors.gps_data.longitude = cached.sbg.ekfNav.position[1] * 1E7;
-                    cached.sensors.gps_data.msl_altitude = cached.sbg.ekfNav.position[2] * 100;
-
-                    cached.sensors.gps_data.horizontal_pos_accuracy = Vector2f(cached.sbg.ekfNav.positionStdDev[0], cached.sbg.ekfNav.positionStdDev[1]).length();
-                    cached.sensors.gps_data.hdop = cached.sensors.gps_data.horizontal_pos_accuracy;
-                    cached.sensors.gps_data.vertical_pos_accuracy = cached.sbg.ekfNav.positionStdDev[2];
-                    cached.sensors.gps_data.vdop =  cached.sensors.gps_data.vertical_pos_accuracy;
-
-                    cached.sensors.gps_data.fix_type = AP_GPS_FixType::FIX_3D;
-
-                    // keep reporting the receiver's satellite count: the raw GPSx_POS
-                    // handler below is skipped in EKF-as-GNSS mode, and a stale count of
-                    // 0 makes EKF3's NSats quality check reject this GPS forever
-                    cached.sensors.gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed;
-
-                    cached.sensors.gps_data.ned_vel_north = cached.sbg.ekfNav.velocity[0];
-                    cached.sensors.gps_data.ned_vel_east = cached.sbg.ekfNav.velocity[1];
-                    cached.sensors.gps_data.ned_vel_down = cached.sbg.ekfNav.velocity[2];
-                    cached.sensors.gps_data.horizontal_vel_accuracy = Vector2f(cached.sbg.ekfNav.velocityStdDev[0], cached.sbg.ekfNav.velocityStdDev[1]).length();
-
-                    updated_gps = true;
+                {
+                    float horizontal_accuracy;
+                    float speed_accuracy;
+                    const NavigationState nav_state = navigation_state(cached.sbg.ekfNav, true, false,
+                                                                       horizontal_accuracy, speed_accuracy);
+                    const bool valid_navigation = nav_state == NavigationState::INERTIAL ||
+                                                  nav_state == NavigationState::GNSS_AIDED;
+                    state.have_velocity = valid_navigation;
+                    state.have_location = valid_navigation;
+                    if (valid_navigation) {
+                        state.velocity = Vector3f(cached.sbg.ekfNav.velocity[0], cached.sbg.ekfNav.velocity[1], cached.sbg.ekfNav.velocity[2]);
+                        state.location = Location(cached.sbg.ekfNav.position[0] * 1e7,
+                                                  cached.sbg.ekfNav.position[1] * 1e7,
+                                                  cached.sbg.ekfNav.position[2] * 1e2,
+                                                  Location::AltFrame::ABSOLUTE);
+                        state.last_location_update_us = AP_HAL::micros();
+                        if (!state.have_origin && cached.sensors.gps_data.fix_type >= AP_GPS_FixType::FIX_3D) {
+                            state.origin = state.location;
+                            state.have_origin = true;
+                        }
+                    }
                 }
                 break;
 
             case SBG_ECOM_LOG_GPS1_VEL: // 13
             case SBG_ECOM_LOG_GPS2_VEL: // 16
+                if (use_ekf_as_gnss && msg.msgid == SBG_ECOM_LOG_GPS2_VEL) {
+                    break;
+                }
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.gnssVel, sizeof(cached.sbg.gnssVel), msg.data, msg.len);
+                received.gps_vel_ms = now_ms;
 
-                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_is_full_nav)) {
+                if (!use_ekf_as_gnss) {
                     cached.sensors.gps_data.ms_tow = cached.sbg.gnssVel.timeOfWeek;
                     cached.sensors.gps_data.ned_vel_north = cached.sbg.gnssVel.velocity[0];
                     cached.sensors.gps_data.ned_vel_east = cached.sbg.gnssVel.velocity[1];
                     cached.sensors.gps_data.ned_vel_down = cached.sbg.gnssVel.velocity[2];
                     cached.sensors.gps_data.horizontal_vel_accuracy = Vector2f(cached.sbg.gnssVel.velocityAcc[0], cached.sbg.gnssVel.velocityAcc[1]).length();
+                    cached.sensors.gps_data.speed_accuracy = Vector3f(cached.sbg.gnssVel.velocityAcc[0], cached.sbg.gnssVel.velocityAcc[1], cached.sbg.gnssVel.velocityAcc[2]).length();
+                    cached.sensors.gps_data.have_speed_accuracy = isfinite(cached.sensors.gps_data.speed_accuracy);
+                    cached.sensors.gps_data.have_vertical_velocity = true;
                     // unused - cached.sbg.gnssVel.course
                     // unused - cached.sbg.gnssVel.courseAcc
                     updated_gps = true;
@@ -541,22 +810,39 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
 
             case SBG_ECOM_LOG_GPS1_POS: // 14
             case SBG_ECOM_LOG_GPS2_POS: // 17
-                safe_copy_msg_to_object((uint8_t*)&cached.sbg.gnssPos, sizeof(cached.sbg.gnssPos), msg.data, msg.len);
+                if (use_ekf_as_gnss && msg.msgid == SBG_ECOM_LOG_GPS2_POS) {
+                    break;
+                }
+                initialise_gnss_pos(cached.sbg.gnssPos);
+                memcpy(&cached.sbg.gnssPos, msg.data, MIN(sizeof(cached.sbg.gnssPos), msg.len));
+                received.gps_pos_ms = now_ms;
 
-                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_is_full_nav)) {
+                if (!use_ekf_as_gnss) {
                     cached.sensors.gps_data.ms_tow = cached.sbg.gnssPos.timeOfWeek;
                     cached.sensors.gps_data.latitude = cached.sbg.gnssPos.latitude * 1E7;
                     cached.sensors.gps_data.longitude = cached.sbg.gnssPos.longitude * 1E7;
                     cached.sensors.gps_data.msl_altitude = cached.sbg.gnssPos.altitude * 100;
-                    // unused - cached.sbg.gnssPos.undulation
+                    // SBG reports ellipsoid minus MSL; AP_GPS uses MSL minus ellipsoid.
+                    cached.sensors.gps_data.undulation = -cached.sbg.gnssPos.undulation;
+                    cached.sensors.gps_data.have_undulation = isfinite(cached.sbg.gnssPos.undulation);
                     cached.sensors.gps_data.horizontal_pos_accuracy = Vector2f(cached.sbg.gnssPos.latitudeAccuracy, cached.sbg.gnssPos.longitudeAccuracy).length();
                     cached.sensors.gps_data.hdop = cached.sensors.gps_data.horizontal_pos_accuracy;
                     cached.sensors.gps_data.vertical_pos_accuracy = cached.sbg.gnssPos.altitudeAccuracy;
                     cached.sensors.gps_data.vdop =  cached.sensors.gps_data.vertical_pos_accuracy;
-                    cached.sensors.gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed;
-                    // unused - cached.sbg.gnssPos.baseStationId
-                    // unused - cached.sbg.gnssPos.differentialAge
-                    cached.sensors.gps_data.fix_type = SbgGpsPosStatus_to_GpsFixType(cached.sbg.gnssPos.status);
+                    cached.sensors.gps_data.have_horizontal_accuracy = isfinite(cached.sensors.gps_data.horizontal_pos_accuracy);
+                    cached.sensors.gps_data.have_vertical_accuracy = isfinite(cached.sensors.gps_data.vertical_pos_accuracy);
+                    cached.sensors.gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed == UINT8_MAX ? 0 : cached.sbg.gnssPos.numSvUsed;
+                    const uint8_t position_status = (cached.sbg.gnssPos.status >> SBG_ECOM_GPS_POS_STATUS_SHIFT) & SBG_ECOM_GPS_POS_STATUS_MASK;
+                    cached.sensors.gps_data.fix_type = position_status == SBG_ECOM_GPS_POS_STATUS_SOL_COMPUTED ?
+                        gps_position_type_to_fix(cached.sbg.gnssPos.status) : AP_GPS_FixType::NONE;
+                    if (cached.sensors.gps_data.fix_type >= AP_GPS_FixType::RTK_FLOAT) {
+                        cached.sensors.gps_data.rtk_age_ms = cached.sbg.gnssPos.differentialAge == UINT16_MAX ?
+                            UINT32_MAX : uint32_t(cached.sbg.gnssPos.differentialAge) * 10U;
+                        cached.sensors.gps_data.rtk_num_sats = cached.sensors.gps_data.satellites_in_view;
+                    } else {
+                        cached.sensors.gps_data.rtk_age_ms = 0;
+                        cached.sensors.gps_data.rtk_num_sats = 0;
+                    }
                     updated_gps = true;
                 }
                 break;
@@ -641,6 +927,10 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
     }
 
     last_received_ms = now_ms;
+
+    if (use_ekf_as_gnss) {
+        publish_ekf_gps(now_ms);
+    }
 }
 
 void AP_ExternalAHRS_SBG::safe_copy_msg_to_object(uint8_t* dest, const uint16_t dest_len, const uint8_t* src, const uint16_t src_len)
@@ -654,14 +944,7 @@ void AP_ExternalAHRS_SBG::safe_copy_msg_to_object(uint8_t* dest, const uint16_t 
     memcpy(dest, src, MIN(dest_len,src_len));
 }
 
-bool AP_ExternalAHRS_SBG::SbgEkfStatus_is_fullNav(const uint32_t ekfStatus)
-{
-    SbgEComSolutionMode solutionMode = (SbgEComSolutionMode)(ekfStatus & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK);
-
-    return (solutionMode == SBG_ECOM_SOL_MODE_NAV_POSITION);
-}
-
-AP_GPS_FixType AP_ExternalAHRS_SBG::SbgGpsPosStatus_to_GpsFixType(const uint32_t gpsPosStatus)
+AP_GPS_FixType AP_ExternalAHRS_SBG::gps_position_type_to_fix(const uint32_t gpsPosStatus)
 {
     const uint32_t fix = (gpsPosStatus >> SBG_ECOM_GPS_POS_TYPE_SHIFT) & SBG_ECOM_GPS_POS_TYPE_MASK;
     switch ((SbgEComGpsPosType)fix) {
@@ -689,6 +972,276 @@ AP_GPS_FixType AP_ExternalAHRS_SBG::SbgGpsPosStatus_to_GpsFixType(const uint32_t
     return AP_GPS_FixType::NONE;
 }
 
+void AP_ExternalAHRS_SBG::publish_ekf_gps(const uint32_t now_ms)
+{
+#if AP_GPS_ENABLED
+    uint8_t instance;
+    if (!AP::gps().get_first_external_instance(instance)) {
+        return;
+    }
+    const uint16_t publish_period_ms = constrain_int16(AP::gps().get_rate_ms(instance), 50, 200);
+    if (gps_has_published && now_ms - last_gps_publish_ms < publish_period_ms) {
+        return;
+    }
+    gps_has_published = true;
+    last_gps_publish_ms = now_ms;
+
+    AP_ExternalAHRS::gps_data_message_t gps_data {};
+    NavigationState nav_state;
+    AP_GPS_FixType fix_type;
+    float horizontal_accuracy;
+    float speed_accuracy;
+    float vertical_accuracy = NAN;
+    uint32_t differential_age_ms = 0;
+    bool nav_stale;
+    bool status_stale;
+    bool utc_valid;
+
+    {
+        WITH_SEMAPHORE(state.sem);
+        const MessageFreshness freshness = message_freshness(received, now_ms);
+        nav_stale = !freshness.ekf_nav;
+        status_stale = !freshness.status;
+        utc_valid = time_anchor.valid && freshness.utc;
+
+        nav_state = navigation_state(cached.sbg.ekfNav, !nav_stale, gnss_is_disabled(),
+                                     horizontal_accuracy, speed_accuracy);
+        fix_type = navigation_fix(nav_state, cached.sbg.ekfNav, cached.sbg.gnssPos,
+                                  freshness.gps_pos, freshness.gps_vel, horizontal_accuracy);
+
+        gps_data = cached.sensors.gps_data;
+        gps_data.fix_type = fix_type;
+        gps_data.gps_week = 0;
+        gps_data.ms_tow = 0;
+        gps_data.satellites_in_view = 0;
+        gps_data.rtk_age_ms = 0;
+        gps_data.rtk_num_sats = 0;
+        gps_data.have_horizontal_accuracy = false;
+        gps_data.have_vertical_accuracy = false;
+        gps_data.have_speed_accuracy = false;
+        gps_data.have_vertical_velocity = false;
+        gps_data.have_undulation = false;
+        gps_data.horizontal_pos_accuracy = NAN;
+        gps_data.vertical_pos_accuracy = NAN;
+        gps_data.horizontal_vel_accuracy = NAN;
+        gps_data.speed_accuracy = NAN;
+        gps_data.hdop = NAN;
+        gps_data.vdop = NAN;
+        gps_data.undulation = NAN;
+
+        const bool valid_navigation = nav_state == NavigationState::INERTIAL ||
+                                      nav_state == NavigationState::GNSS_AIDED;
+        if (valid_navigation) {
+            gps_data.latitude = cached.sbg.ekfNav.position[0] * 1.0e7;
+            gps_data.longitude = cached.sbg.ekfNav.position[1] * 1.0e7;
+            gps_data.msl_altitude = cached.sbg.ekfNav.position[2] * 100.0;
+            gps_data.ned_vel_north = cached.sbg.ekfNav.velocity[0];
+            gps_data.ned_vel_east = cached.sbg.ekfNav.velocity[1];
+            gps_data.ned_vel_down = cached.sbg.ekfNav.velocity[2];
+
+            vertical_accuracy = cached.sbg.ekfNav.positionStdDev[2];
+            gps_data.horizontal_pos_accuracy = horizontal_accuracy;
+            gps_data.vertical_pos_accuracy = vertical_accuracy;
+            gps_data.horizontal_vel_accuracy = Vector2f(cached.sbg.ekfNav.velocityStdDev[0],
+                                                         cached.sbg.ekfNav.velocityStdDev[1]).length();
+            gps_data.speed_accuracy = speed_accuracy;
+            gps_data.hdop = horizontal_accuracy;
+            gps_data.vdop = vertical_accuracy;
+            gps_data.have_horizontal_accuracy = true;
+            gps_data.have_vertical_accuracy = true;
+            gps_data.have_speed_accuracy = true;
+            gps_data.have_vertical_velocity = true;
+            // SBG reports ellipsoid minus MSL; AP_GPS uses MSL minus ellipsoid.
+            gps_data.undulation = -cached.sbg.ekfNav.undulation;
+            gps_data.have_undulation = isfinite(cached.sbg.ekfNav.undulation);
+
+            if (utc_valid) {
+                extrapolate_gps_time(time_anchor, cached.sbg.ekfNav.timeStamp,
+                                     gps_data.gps_week, gps_data.ms_tow);
+            }
+        }
+
+        if (freshness.gps_pos && cached.sbg.gnssPos.numSvUsed != UINT8_MAX) {
+            gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed;
+        }
+        if (freshness.gps_pos) {
+            differential_age_ms = cached.sbg.gnssPos.differentialAge == UINT16_MAX ?
+                UINT32_MAX : uint32_t(cached.sbg.gnssPos.differentialAge) * 10U;
+        }
+        if (fix_type >= AP_GPS_FixType::RTK_FLOAT) {
+            gps_data.rtk_age_ms = differential_age_ms;
+            gps_data.rtk_num_sats = gps_data.satellites_in_view;
+        }
+
+        cached.sensors.gps_data = gps_data;
+        cached.sensors.gps_ms = now_ms;
+    }
+
+    update_transition_messages(now_ms, nav_state, fix_type, nav_stale, status_stale, utc_valid);
+    write_sbg_log(nav_state, fix_type, horizontal_accuracy, vertical_accuracy,
+                  speed_accuracy, differential_age_ms);
+    AP::gps().handle_external(gps_data, instance);
+#else
+    (void)now_ms;
+#endif
+}
+
+void AP_ExternalAHRS_SBG::update_transition_messages(const uint32_t now_ms,
+                                                     const NavigationState nav_state,
+                                                     const AP_GPS_FixType fix_type,
+                                                     const bool nav_stale,
+                                                     const bool status_stale,
+                                                     const bool utc_valid)
+{
+    const uint8_t ekf_mode = cached.sbg.ekfNav.status & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK;
+    const bool zupt = cached.sbg.ekfNav.status & SBG_ECOM_SOL_ZUPT_USED;
+    const uint8_t ifm = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_IFM_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t spoofing = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_SPOOFING_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t osnma = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_OSNMA_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const bool first_update = previous_ekf_mode == UINT8_MAX;
+
+    if (!nav_stale && ekf_mode != previous_ekf_mode &&
+        (mode_message_ms == 0 || now_ms - mode_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: EKF mode %u", unsigned(ekf_mode));
+        mode_message_ms = now_ms;
+    }
+    if (!nav_stale) {
+        previous_ekf_mode = ekf_mode;
+    }
+
+    if (have_previous_nav_state && nav_state != previous_nav_state &&
+        (nav_message_ms == 0 || now_ms - nav_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        if (nav_state == NavigationState::INERTIAL) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: inertial navigation");
+        } else if (nav_state == NavigationState::GNSS_AIDED) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: GNSS aiding restored (%u)", unsigned(fix_type));
+        }
+        nav_message_ms = now_ms;
+    }
+    previous_nav_state = nav_state;
+    have_previous_nav_state = true;
+
+    if (!first_update && zupt != previous_zupt &&
+        (zupt_message_ms == 0 || now_ms - zupt_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, zupt ? "SBG: ZUPT active" : "SBG: ZUPT cleared");
+        zupt_message_ms = now_ms;
+    }
+    previous_zupt = zupt;
+
+    if (previous_ifm != UINT8_MAX && ifm != previous_ifm &&
+        (interference_message_ms == 0 || now_ms - interference_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        if (ifm == SBG_ECOM_GNSS_IFM_STATUS_CRITICAL) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS interference critical");
+        } else if (ifm == SBG_ECOM_GNSS_IFM_STATUS_MITIGATED) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS interference mitigated");
+        } else if (previous_ifm == SBG_ECOM_GNSS_IFM_STATUS_CRITICAL ||
+                   previous_ifm == SBG_ECOM_GNSS_IFM_STATUS_MITIGATED) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: GNSS interference cleared");
+        }
+        interference_message_ms = now_ms;
+    }
+    previous_ifm = ifm;
+
+    if (previous_spoofing != UINT8_MAX && (spoofing != previous_spoofing || osnma != previous_osnma) &&
+        (spoofing_message_ms == 0 || now_ms - spoofing_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        if (osnma == SBG_ECOM_GNSS_OSNMA_STATUS_SPOOFED) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS OSNMA spoofing");
+        } else if (spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_MULTIPLE) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS spoofing confirmed");
+        } else if (spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_SINGLE) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS spoofing probable");
+        } else if (previous_spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_SINGLE ||
+                   previous_spoofing == SBG_ECOM_GNSS_SPOOFING_STATUS_MULTIPLE ||
+                   previous_osnma == SBG_ECOM_GNSS_OSNMA_STATUS_SPOOFED) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: GNSS spoofing cleared");
+        }
+        spoofing_message_ms = now_ms;
+    }
+    previous_spoofing = spoofing;
+    previous_osnma = osnma;
+
+    if (!first_update && utc_valid != previous_utc_valid &&
+        (utc_message_ms == 0 || now_ms - utc_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        GCS_SEND_TEXT(utc_valid ? MAV_SEVERITY_INFO : MAV_SEVERITY_WARNING,
+                      utc_valid ? "SBG: UTC valid" : "SBG: UTC invalid");
+        utc_message_ms = now_ms;
+    }
+    previous_utc_valid = utc_valid;
+
+    if ((!first_update && (nav_stale != previous_nav_stale || status_stale != previous_status_stale)) &&
+        (stale_message_ms == 0 || now_ms - stale_message_ms >= TRANSITION_MESSAGE_INTERVAL_MS)) {
+        if (nav_stale && status_stale) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: EKF NAV/STATUS stale");
+        } else if (nav_stale) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: EKF NAV stale");
+        } else if (status_stale) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: STATUS stale");
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: required logs restored");
+        }
+        stale_message_ms = now_ms;
+    }
+    previous_nav_stale = nav_stale;
+    previous_status_stale = status_stale;
+}
+
+void AP_ExternalAHRS_SBG::write_sbg_log(const NavigationState nav_state,
+                                        const AP_GPS_FixType fix_type,
+                                        const float horizontal_accuracy,
+                                        const float vertical_accuracy,
+                                        const float speed_accuracy,
+                                        const uint32_t differential_age_ms) const
+{
+#if HAL_LOGGING_ENABLED
+    const uint8_t ifm = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_IFM_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t spoofing = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_SPOOFING_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t osnma = (cached.sbg.gnssPos.statusExt >> SBG_ECOM_GPS_POS_OSNMA_SHIFT) & SBG_ECOM_GPS_POS_EXT_STATUS_MASK;
+    const uint8_t sv_used = cached.sbg.gnssPos.numSvUsed == UINT8_MAX ? 0 : cached.sbg.gnssPos.numSvUsed;
+    const uint8_t sv_tracked = cached.sbg.gnssPos.numSvTracked == UINT8_MAX ? 0 : cached.sbg.gnssPos.numSvTracked;
+    const uint8_t gnss_used = uint8_t(bool(cached.sbg.ekfNav.status & SBG_ECOM_SOL_GPS1_POS_USED)) |
+                              (uint8_t(bool(cached.sbg.ekfNav.status & SBG_ECOM_SOL_GPS1_VEL_USED)) << 1);
+    const uint16_t security = uint16_t(ifm) |
+                              (uint16_t(spoofing) << 4) |
+                              (uint16_t(osnma) << 8);
+    const uint16_t satellites = uint16_t(sv_used) | (uint16_t(sv_tracked) << 8);
+    const uint8_t flags = uint8_t(bool(cached.sbg.ekfNav.status & SBG_ECOM_SOL_ZUPT_USED)) |
+                          (uint8_t(bool(cached.sbg.ekfNav.status & SBG_ECOM_SOL_ALIGN_VALID)) << 1) |
+                          (gnss_used << 2);
+
+    // FMT records support at most 16 fields and 64 label characters. Pack
+    // related diagnostics so this high-rate record remains self describing.
+    AP::logger().WriteStreaming(
+        "SBGS", "TimeUS,TS,GWk,GMS,ES,Mode,Nav,Fix,GS,Sec,SV,HA,VA,SA,DA,Flg",
+        "QIHIIBBBIIHfffIB",
+        AP_HAL::micros64(),
+        cached.sbg.ekfNav.timeStamp,
+        cached.sensors.gps_data.gps_week,
+        cached.sensors.gps_data.ms_tow,
+        cached.sbg.ekfNav.status,
+        uint8_t(cached.sbg.ekfNav.status & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK),
+        uint8_t(nav_state), uint8_t(fix_type), cached.sbg.gnssPos.status, security, satellites,
+        horizontal_accuracy, vertical_accuracy, speed_accuracy, differential_age_ms,
+        flags);
+#else
+    (void)nav_state;
+    (void)fix_type;
+    (void)horizontal_accuracy;
+    (void)vertical_accuracy;
+    (void)speed_accuracy;
+    (void)differential_age_ms;
+#endif
+}
+
+bool AP_ExternalAHRS_SBG::healthy(void) const
+{
+    const uint32_t now_ms = AP_HAL::millis();
+    if (option_is_set(AP_ExternalAHRS::OPTIONS::SBG_EKF_AS_GNSS)) {
+        const MessageFreshness freshness = message_freshness(received, now_ms);
+        return freshness.ekf_nav && freshness.status;
+    }
+    return last_received_ms > 0 && now_ms - last_received_ms < 500;
+}
+
 void AP_ExternalAHRS_SBG::get_filter_status(nav_filter_status &status) const
 {
     WITH_SEMAPHORE(state.sem);
@@ -707,7 +1260,7 @@ void AP_ExternalAHRS_SBG::get_filter_status(nav_filter_status &status) const
         status.flags.horiz_pos_abs = true;
         status.flags.pred_horiz_pos_rel = true;
         status.flags.pred_horiz_pos_abs = true;
-        status.flags.using_gps = true;
+        status.flags.using_gps = bool(cached.sbg.ekfNav.status & SBG_ECOM_SOL_GPS1_POS_USED);
     }
 
     if (state.have_quaternion) {
@@ -726,8 +1279,26 @@ bool AP_ExternalAHRS_SBG::pre_arm_check(char *failure_msg, uint8_t failure_msg_l
         hal.util->snprintf(failure_msg, failure_msg_len, "SBG setup failed");
         return false;
     }
-    if (!healthy()) {
-        hal.util->snprintf(failure_msg, failure_msg_len, "SBG unhealthy");
+    if (option_is_set(AP_ExternalAHRS::OPTIONS::SBG_EKF_AS_GNSS)) {
+        const uint32_t now_ms = AP_HAL::millis();
+        if (received.ekf_nav_ms == 0) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "SBG missing EKF NAV");
+            return false;
+        }
+        if (now_ms - received.ekf_nav_ms > EKF_NAV_TIMEOUT_MS) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "SBG EKF NAV stale");
+            return false;
+        }
+        if (received.status_ms == 0) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "SBG missing STATUS");
+            return false;
+        }
+        if (now_ms - received.status_ms > STATUS_TIMEOUT_MS) {
+            hal.util->snprintf(failure_msg, failure_msg_len, "SBG STATUS stale");
+            return false;
+        }
+    } else if (!healthy()) {
+        hal.util->snprintf(failure_msg, failure_msg_len, "SBG link stale");
         return false;
     }
     return true;
@@ -814,4 +1385,3 @@ bool AP_ExternalAHRS_SBG::get_variances(float &velVar, float &posVar, float &hgt
 }
 
 #endif  // AP_EXTERNAL_AHRS_SBG_ENABLED
-

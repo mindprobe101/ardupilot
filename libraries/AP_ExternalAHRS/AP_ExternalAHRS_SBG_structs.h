@@ -29,6 +29,8 @@
 #define SBG_ECOM_CLOCK_STATUS_MASK			(0x000Fu)				/*!< Mask used to keep only the clock status part. */
 #define SBG_ECOM_CLOCK_UTC_STATUS_SHIFT		(6u)					/*!< Shift used to extract the clock UTC status part. */
 #define SBG_ECOM_CLOCK_UTC_STATUS_MASK		(0x000Fu)				/*!< Mask used to keep only the clock UTC status part. */
+#define SBG_ECOM_CLOCK_HAS_INPUT              (0x0001u << 0)
+#define SBG_ECOM_CLOCK_UTC_IS_ACCURATE        (0x0001u << 5)
 
 /*!
  * Clock status enum.
@@ -71,6 +73,9 @@ typedef struct PACKED _SbgEComLogUtc
 	int8_t		second;						/*!< Second in minute [0 .. 60]. (60 is used only when a leap second is added) */
 	int32_t		nanoSecond;					/*!< Nanosecond of current second in ns. */
 	uint32_t	gpsTimeOfWeek;				/*!< GPS time of week in ms. */
+	float       clkBiasStd;                 /*!< Internal clock bias standard deviation in seconds (since 4.0). */
+	float       clkSfErrorStd;              /*!< Internal clock scale factor error standard deviation (since 4.0). */
+	float       clkResidualError;           /*!< Latest PPS residual clock error in seconds (since 4.0). */
 } SbgEComLogUtc;
 
 
@@ -107,6 +112,10 @@ typedef struct PACKED _SbgEComLogGnssPos
 	uint8_t			numSvUsed;				/*!< Number of space vehicles used to compute the solution (since version 1.4). */
 	uint16_t		baseStationId;			/*!< Base station id for differential corrections (0-4095). Set to 0xFFFF if differential corrections are not used (since version 1.4). */
 	uint16_t		differentialAge;		/*!< Differential correction age in 0.01 seconds. Set to 0XFFFF if differential corrections are not used (since version 1.4). */
+	uint8_t         numSvTracked;           /*!< Number of tracked space vehicles, 0xFF if unavailable (since 4.0). */
+	uint32_t        statusExt;              /*!< Interference, spoofing and OSNMA status (since 4.0). */
+	uint8_t         nrDiagReboots;          /*!< GNSS diagnostic reboot count (since 5.6). */
+	uint32_t        upTime;                 /*!< GNSS uptime in seconds, 0xFFFFFFFF if unavailable (since 5.6). */
 } SbgEComLogGnssPos;
 
 /*!
@@ -217,6 +226,31 @@ typedef struct PACKED _SbgEComLogImuShort
 
 
 #define SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK         (0x0000000Fu)       /*!< Mask used to keep only the clock status part. */
+
+#define SBG_ECOM_SOL_ATTITUDE_VALID         (0x00000001u << 4)
+#define SBG_ECOM_SOL_HEADING_VALID          (0x00000001u << 5)
+#define SBG_ECOM_SOL_VELOCITY_VALID         (0x00000001u << 6)
+#define SBG_ECOM_SOL_POSITION_VALID         (0x00000001u << 7)
+#define SBG_ECOM_SOL_VERT_REF_USED          (0x00000001u << 8)
+#define SBG_ECOM_SOL_MAG_REF_USED           (0x00000001u << 9)
+#define SBG_ECOM_SOL_GPS1_VEL_USED          (0x00000001u << 10)
+#define SBG_ECOM_SOL_GPS1_POS_USED          (0x00000001u << 11)
+#define SBG_ECOM_SOL_VEL_CONSTRAINTS_USED   (0x00000001u << 12)
+#define SBG_ECOM_SOL_GPS1_HDT_USED          (0x00000001u << 13)
+#define SBG_ECOM_SOL_GPS2_VEL_USED          (0x00000001u << 14)
+#define SBG_ECOM_SOL_GPS2_POS_USED          (0x00000001u << 15)
+#define SBG_ECOM_SOL_GPS2_HDT_USED          (0x00000001u << 17)
+#define SBG_ECOM_SOL_ODO_USED               (0x00000001u << 18)
+#define SBG_ECOM_SOL_DVL_BT_USED            (0x00000001u << 19)
+#define SBG_ECOM_SOL_DVL_WT_USED            (0x00000001u << 20)
+#define SBG_ECOM_SOL_VEL1_USED              (0x00000001u << 21)
+#define SBG_ECOM_SOL_USBL_USED              (0x00000001u << 24)
+#define SBG_ECOM_SOL_AIRSPEED_USED          (0x00000001u << 25)
+#define SBG_ECOM_SOL_ZUPT_USED              (0x00000001u << 26)
+#define SBG_ECOM_SOL_ALIGN_VALID            (0x00000001u << 27)
+#define SBG_ECOM_SOL_VERTICAL_AIDING_USED   (0x00000001u << 28)
+#define SBG_ECOM_SOL_ZARU_USED              (0x00000001u << 29)
+#define SBG_ECOM_SOL_POS1_USED              (0x00000001u << 30)
 
 /*!
  * Solution filter mode enum.
@@ -337,12 +371,13 @@ typedef struct PACKED _SbgEComLogStatus
 {
 	uint32_t	timeStamp;					/*!< Time in us since the sensor power up. */
 	uint16_t	generalStatus;				/*!< General status bitmask and enums. */
-	uint16_t	reserved1;					/*!< Reserved status field for future use */
 	uint32_t	comStatus;					/*!< Communication status bitmask and enums. */
+	uint16_t	comStatus2;					/*!< Second communication status field (since 4.0). */
 	uint32_t	aidingStatus;				/*!< Aiding equipments status bitmask and enums. */
 	uint32_t	reserved2;					/*!< Reserved status field for future use. */
 	uint16_t	reserved3;					/*!< Reserved status field for future use. */
 	uint32_t	uptime;						/*!< System uptime in seconds. */
+	uint8_t     cpuUsage;                   /*!< Main CPU usage in percent, 0xFF if unavailable (since 5.0). */
 } SbgEComLogStatus;
 
 /*!
@@ -430,8 +465,62 @@ typedef enum _SbgEComGpsPosType
 	SBG_ECOM_POS_FIXED				= 10							/*!< Fixed location solution position. */
 } SbgEComGpsPosType;
 
+#define SBG_ECOM_GPS_POS_STATUS_SHIFT          (0u)
+#define SBG_ECOM_GPS_POS_STATUS_MASK           (0x0000003Fu)
 #define SBG_ECOM_GPS_POS_TYPE_SHIFT			(6u)					/*!< Shift used to extract the GPS position type part. */
 #define SBG_ECOM_GPS_POS_TYPE_MASK			(0x0000003Fu)			/*!< Mask used to keep only the GPS position type part. */
+
+typedef enum _SbgEComGpsPosStatus
+{
+    SBG_ECOM_GPS_POS_STATUS_SOL_COMPUTED       = 0,
+    SBG_ECOM_GPS_POS_STATUS_INSUFFICIENT_OBS   = 1,
+    SBG_ECOM_GPS_POS_STATUS_INTERNAL_ERROR     = 2,
+    SBG_ECOM_GPS_POS_STATUS_HEIGHT_LIMIT       = 3
+} SbgEComGpsPosStatus;
+
+typedef enum _SbgEComGnssIfmStatus
+{
+    SBG_ECOM_GNSS_IFM_STATUS_ERROR             = 0,
+    SBG_ECOM_GNSS_IFM_STATUS_UNKNOWN           = 1,
+    SBG_ECOM_GNSS_IFM_STATUS_CLEAN             = 2,
+    SBG_ECOM_GNSS_IFM_STATUS_MITIGATED         = 3,
+    SBG_ECOM_GNSS_IFM_STATUS_CRITICAL          = 4
+} SbgEComGnssIfmStatus;
+
+typedef enum _SbgEComGnssSpoofingStatus
+{
+    SBG_ECOM_GNSS_SPOOFING_STATUS_ERROR        = 0,
+    SBG_ECOM_GNSS_SPOOFING_STATUS_UNKNOWN      = 1,
+    SBG_ECOM_GNSS_SPOOFING_STATUS_CLEAN        = 2,
+    SBG_ECOM_GNSS_SPOOFING_STATUS_SINGLE       = 3,
+    SBG_ECOM_GNSS_SPOOFING_STATUS_MULTIPLE     = 4
+} SbgEComGnssSpoofingStatus;
+
+typedef enum _SbgEComGnssOsnmaStatus
+{
+    SBG_ECOM_GNSS_OSNMA_STATUS_ERROR           = 0,
+    SBG_ECOM_GNSS_OSNMA_STATUS_DISABLED        = 1,
+    SBG_ECOM_GNSS_OSNMA_STATUS_INITIALIZING    = 2,
+    SBG_ECOM_GNSS_OSNMA_STATUS_WAITING_NTP     = 3,
+    SBG_ECOM_GNSS_OSNMA_STATUS_VALID           = 4,
+    SBG_ECOM_GNSS_OSNMA_STATUS_SPOOFED         = 5
+} SbgEComGnssOsnmaStatus;
+
+#define SBG_ECOM_GPS_POS_IFM_SHIFT              (0u)
+#define SBG_ECOM_GPS_POS_EXT_STATUS_MASK        (0x0000000Fu)
+#define SBG_ECOM_GPS_POS_SPOOFING_SHIFT         (4u)
+#define SBG_ECOM_GPS_POS_OSNMA_SHIFT            (8u)
+
+static_assert(sizeof(SbgEComLogUtc) == 33, "unexpected SBG UTC payload size");
+static_assert(offsetof(SbgEComLogUtc, clkBiasStd) == 21, "unexpected SBG UTC clock accuracy offset");
+static_assert(sizeof(SbgEComLogGnssPos) == 67, "unexpected SBG GPS POS payload size");
+static_assert(offsetof(SbgEComLogGnssPos, statusExt) == 58, "unexpected SBG GPS POS extended status offset");
+static_assert(offsetof(SbgEComLogGnssPos, upTime) == 63, "unexpected SBG GPS POS uptime offset");
+static_assert(sizeof(SbgEComLogEkfNav) == 72, "unexpected SBG EKF NAV payload size");
+static_assert(sizeof(SbgEComLogStatus) == 27, "unexpected SBG STATUS payload size");
+static_assert(offsetof(SbgEComLogStatus, comStatus) == 6, "unexpected SBG STATUS comStatus offset");
+static_assert(offsetof(SbgEComLogStatus, comStatus2) == 10, "unexpected SBG STATUS comStatus2 offset");
+static_assert(offsetof(SbgEComLogStatus, aidingStatus) == 12, "unexpected SBG STATUS aidingStatus offset");
 
 
 
@@ -717,4 +806,3 @@ typedef enum _SbgEComCmd
 
 
 #endif  // AP_EXTERNAL_AHRS_SBG_ENABLED
-

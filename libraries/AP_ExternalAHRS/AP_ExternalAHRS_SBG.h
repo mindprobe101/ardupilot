@@ -36,7 +36,7 @@ public:
     int8_t get_port(void) const override { return (uart == nullptr) ? -1 : port_num; }
 
     // accessors for AP_AHRS
-    bool healthy(void) const override { return last_received_ms > 0 && (AP_HAL::millis() - last_received_ms < 500); }
+    bool healthy(void) const override;
     bool initialised(void) const override { return setup_complete; };
     bool pre_arm_check(char *failure_msg, uint8_t failure_msg_len) const override;
 
@@ -50,6 +50,93 @@ public:
     // Get model/type name
     const char* get_name() const override { return "SBG"; }
 
+    static constexpr uint8_t SBG_PACKET_SYNC1 = 0xFF;
+    static constexpr uint8_t SBG_PACKET_SYNC2 = 0x5A;
+    static constexpr uint8_t SBG_PACKET_ETX = 0x33;
+    static constexpr uint16_t SBG_PACKET_PAYLOAD_SIZE_MAX = 100;
+    static constexpr uint16_t SBG_PACKET_OVERHEAD = 9;
+
+    struct PACKED sbgMessage {
+        uint8_t msgid = 0;
+        uint8_t msgclass = 0;
+        uint16_t len = 0;
+        uint8_t data[SBG_PACKET_PAYLOAD_SIZE_MAX] {};
+
+        sbgMessage() = default;
+        sbgMessage(uint8_t msgClass_, uint8_t msgId_);
+        sbgMessage(uint8_t msgClass_, uint8_t msgId_, const uint8_t* payload, uint16_t payload_len);
+    };
+
+    enum class SBG_PACKET_PARSE_STATE : uint8_t {
+        SYNC1,
+        SYNC2,
+        MSG,
+        CLASS,
+        LEN1,
+        LEN2,
+        DATA,
+        CRC1,
+        CRC2,
+        ETX,
+        DROP_THIS_PACKET
+    };
+
+    struct SBG_PACKET_INBOUND_STATE {
+        SBG_PACKET_PARSE_STATE parser = SBG_PACKET_PARSE_STATE::SYNC1;
+        uint16_t data_count = 0;
+        uint16_t crc = 0;
+        bool crc_valid = false;
+        sbgMessage msg;
+        uint32_t data_count_skip = 0;
+    };
+
+    enum class NavigationState : uint8_t {
+        NO_NAVIGATION,
+        INVALID_NAVIGATION,
+        INERTIAL,
+        GNSS_AIDED,
+        ADMIN_DISABLED,
+        STALE
+    };
+
+    struct TimeAnchor {
+        uint16_t week = 0;
+        uint32_t tow_ms = 0;
+        uint32_t sbg_timestamp = 0;
+        bool valid = false;
+    };
+
+    struct ReceiveTimes {
+        uint32_t ekf_nav_ms = 0;
+        uint32_t gps_pos_ms = 0;
+        uint32_t gps_vel_ms = 0;
+        uint32_t utc_ms = 0;
+        uint32_t status_ms = 0;
+    };
+
+    struct MessageFreshness {
+        bool ekf_nav;
+        bool gps_pos;
+        bool gps_vel;
+        bool utc;
+        bool status;
+    };
+
+    // Protocol and policy helpers are public to permit deterministic unit tests.
+    static bool parse_byte(uint8_t data, sbgMessage &msg, SBG_PACKET_INBOUND_STATE &inbound_state);
+    static bool payload_length_valid(uint8_t msgclass, uint8_t msgid, uint16_t payload_len);
+    static bool make_gps_week(const SbgEComLogUtc &utc_data, uint16_t &gps_week);
+    static bool extrapolate_gps_time(const TimeAnchor &anchor, uint32_t sbg_timestamp, uint16_t &gps_week, uint32_t &tow_ms);
+    static bool utc_anchor_valid(const SbgEComLogUtc &utc);
+    static MessageFreshness message_freshness(const ReceiveTimes &times, uint32_t now_ms);
+    static NavigationState navigation_state(const SbgEComLogEkfNav &ekf_nav, bool nav_fresh, bool disabled,
+                                            float &horizontal_accuracy, float &speed_accuracy);
+    static AP_GPS_FixType navigation_fix(NavigationState nav_state, const SbgEComLogEkfNav &ekf_nav,
+                                         const SbgEComLogGnssPos &gnss_pos, bool gnss_pos_fresh, bool gnss_vel_fresh,
+                                         float horizontal_accuracy);
+    static AP_GPS_FixType gps_position_type_to_fix(uint32_t gps_pos_status);
+    static AP_GPS_FixType accuracy_to_fix(float horizontal_accuracy);
+
 protected:
 
     uint8_t num_gps_sensors(void) const override {
@@ -57,12 +144,11 @@ protected:
     }
 
 private:
-
-    static constexpr uint8_t SBG_PACKET_SYNC1 = 0xFF;
-    static constexpr uint8_t SBG_PACKET_SYNC2 = 0x5A;
-    static constexpr uint8_t SBG_PACKET_ETX = 0x33;
-    static constexpr uint16_t SBG_PACKET_PAYLOAD_SIZE_MAX = 100; // real sbgCom limit is 4086 but the largest packet we parse is SbgEComLogEkfNav=72 bytes
-    static constexpr uint16_t SBG_PACKET_OVERHEAD = 9; // sync1, sync2, id, class, lenLSB, lenMSB, crcLSB, crcMSB, etx
+    static constexpr uint32_t EKF_NAV_TIMEOUT_MS = 200;
+    static constexpr uint32_t STATUS_TIMEOUT_MS = 500;
+    static constexpr uint32_t GNSS_TIMEOUT_MS = 1000;
+    static constexpr uint32_t UTC_TIMEOUT_MS = 2500;
+    static constexpr uint32_t TRANSITION_MESSAGE_INTERVAL_MS = 2000;
 
     struct Cached {
         struct {
@@ -85,6 +171,7 @@ private:
             SbgEComLogUtc utc;
             SbgEComLogGnssVel gnssVel;
             SbgEComLogGnssPos gnssPos;
+            SbgEComLogStatus status;
             SbgEComLogImuLegacy imuLegacy;
             SbgEComLogImuFastLegacy imuFastLegacy;
             SbgEComLogImuShort imuShort;
@@ -95,84 +182,59 @@ private:
             SbgEComLogMag mag;
             SbgEComDeviceInfo deviceInfo;
        } sbg;
-    } cached;
+    } cached {};
 
-    struct PACKED sbgMessage {
+    ReceiveTimes received;
 
-        uint8_t msgid = 0;
-        uint8_t msgclass = 0;
-        uint16_t len = 0;
-        uint8_t data[SBG_PACKET_PAYLOAD_SIZE_MAX];
-
-        sbgMessage() {};
-
-        sbgMessage(const uint8_t msgClass_, const uint8_t msgId_) {
-            msgid = msgId_;
-            msgclass = msgClass_;
-        };
-
-        sbgMessage(const uint8_t msgClass_, const uint8_t msgId_, const uint8_t* payload, const uint16_t payload_len) {
-            msgid = msgId_;
-            msgclass = msgClass_;
-
-            if (payload_len > 0 && payload_len <= sizeof(data)) {
-                memcpy(&data, payload, payload_len);
-                len = payload_len;
-            }
-        };
-    };
-
-    enum class SBG_PACKET_PARSE_STATE : uint8_t {
-        SYNC1,
-        SYNC2,
-        MSG,
-        CLASS,
-        LEN1,
-        LEN2,
-        DATA,
-        CRC1,
-        CRC2,
-        ETX,
-        DROP_THIS_PACKET
-    };
-
-
-    struct SBG_PACKET_INBOUND_STATE {
-        SBG_PACKET_PARSE_STATE parser;
-        uint16_t data_count;
-        uint16_t crc;
-        sbgMessage msg;
-        uint16_t data_count_skip; // if we are parsing for a packet larger than we can accept, just stop parsing and wait for this many bytes to pass on by
-    } _inbound_state;
+    SBG_PACKET_INBOUND_STATE _inbound_state;
+    TimeAnchor time_anchor;
 
     void handle_msg(const sbgMessage &msg);
-    static bool parse_byte(const uint8_t data, sbgMessage &msg, SBG_PACKET_INBOUND_STATE &inbound_state);
     void update_thread();
     bool check_uart();
-    static uint16_t calcCRC(const void *pBuffer, uint16_t bufferSize);
     static bool send_sbgMessage(AP_HAL::UARTDriver *_uart, const sbgMessage &msg);
     static void safe_copy_msg_to_object(uint8_t* dest, const uint16_t dest_len, const uint8_t* src, const uint16_t src_len);
-    static uint16_t make_gps_week(const SbgEComLogUtc *utc_data);
+    void publish_ekf_gps(uint32_t now_ms);
+    void update_transition_messages(uint32_t now_ms, NavigationState nav_state, AP_GPS_FixType fix_type,
+                                    bool nav_stale, bool status_stale, bool utc_valid);
+    void write_sbg_log(NavigationState nav_state, AP_GPS_FixType fix_type, float horizontal_accuracy,
+                       float vertical_accuracy, float speed_accuracy, uint32_t differential_age_ms) const;
+    static void initialise_gnss_pos(SbgEComLogGnssPos &gnss_pos);
+    static void initialise_utc(SbgEComLogUtc &utc);
 
-    bool ekf_is_full_nav;
-    static bool SbgEkfStatus_is_fullNav(const uint32_t ekfStatus);
-
-    static AP_GPS_FixType SbgGpsPosStatus_to_GpsFixType(const uint32_t gpsPosStatus);
-
-    uint32_t send_MagData_ms;
-    uint32_t send_AirData_ms;
-    uint32_t send_mag_error_last_ms;
-    uint32_t send_air_error_last_ms;
+    uint32_t send_MagData_ms = 0;
+    uint32_t send_AirData_ms = 0;
+    uint32_t send_mag_error_last_ms = 0;
+    uint32_t send_air_error_last_ms = 0;
     static bool send_MagData(AP_HAL::UARTDriver *_uart);
     static bool send_AirData(AP_HAL::UARTDriver *_uart);
 
-    AP_HAL::UARTDriver *uart;
-    int8_t port_num;
-    uint32_t baudrate;
-    bool setup_complete;
-    uint32_t version_check_ms;
-    uint32_t last_received_ms;
+    AP_HAL::UARTDriver *uart = nullptr;
+    int8_t port_num = -1;
+    uint32_t baudrate = 0;
+    bool setup_complete = false;
+    uint32_t version_check_ms = 0;
+    uint32_t last_received_ms = 0;
+    uint32_t last_gps_publish_ms = 0;
+    bool gps_has_published = false;
+
+    uint8_t previous_ekf_mode = UINT8_MAX;
+    NavigationState previous_nav_state = NavigationState::NO_NAVIGATION;
+    bool have_previous_nav_state = false;
+    bool previous_zupt = false;
+    bool previous_utc_valid = false;
+    bool previous_nav_stale = true;
+    bool previous_status_stale = true;
+    uint8_t previous_ifm = UINT8_MAX;
+    uint8_t previous_spoofing = UINT8_MAX;
+    uint8_t previous_osnma = UINT8_MAX;
+    uint32_t mode_message_ms = 0;
+    uint32_t nav_message_ms = 0;
+    uint32_t zupt_message_ms = 0;
+    uint32_t interference_message_ms = 0;
+    uint32_t spoofing_message_ms = 0;
+    uint32_t utc_message_ms = 0;
+    uint32_t stale_message_ms = 0;
 };
 
 #endif  // AP_EXTERNAL_AHRS_SBG_ENABLED
-

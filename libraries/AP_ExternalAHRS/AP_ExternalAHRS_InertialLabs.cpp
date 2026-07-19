@@ -305,6 +305,7 @@ bool AP_ExternalAHRS_InertialLabs::check_uart()
             gps_data.ned_vel_north = state.velocity.x; // m/s
             gps_data.ned_vel_east = state.velocity.y; // m/s
             gps_data.ned_vel_down = state.velocity.z; // m/s
+            gps_data.have_vertical_velocity = true;
             state.have_velocity = true;
             last_vel_ms = now_ms;
             break;
@@ -1121,4 +1122,3 @@ bool AP_ExternalAHRS_InertialLabs::get_variances(float &velVar, float &posVar, f
 }
 
 #endif  // AP_EXTERNAL_AHRS_INERTIALLABS_ENABLED
-

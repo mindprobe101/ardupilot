@@ -270,6 +270,10 @@ public:
     void handle_external(const AP_ExternalAHRS::gps_data_message_t &pkt, const uint8_t instance);
 #endif
 
+    // Returns the configured update period for an instance, constrained to
+    // the range supported by AP_GPS. This is not a measured update rate.
+    uint16_t get_rate_ms(uint8_t instance) const;
+
     // Accessor functions
 
     // return number of active GPS sensors. Note that if the first GPS
@@ -641,12 +645,6 @@ protected:
 private:
     static AP_GPS *_singleton;
     HAL_Semaphore rsem;
-
-    // returns the desired gps update rate in milliseconds
-    // this does not provide any guarantee that the GPS is updating at the requested
-    // rate it is simply a helper for use in the backends for determining what rate
-    // they should be configuring the GPS to run at
-    uint16_t get_rate_ms(uint8_t instance) const;
 
     struct GPS_timing {
         // the time we got our last fix in system milliseconds

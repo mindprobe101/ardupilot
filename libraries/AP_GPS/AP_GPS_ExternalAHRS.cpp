@@ -21,6 +21,14 @@
 
 #if HAL_EXTERNAL_AHRS_ENABLED
 
+static uint16_t external_dop_to_gps_dop(const float dop)
+{
+    if (!isfinite(dop) || is_negative(dop)) {
+        return GPS_UNKNOWN_DOP;
+    }
+    return uint16_t(MIN(dop * 100.0f, float(GPS_UNKNOWN_DOP - 1)));
+}
+
 // Reading does nothing in this class; we simply return whether or not
 // the latest reading has been consumed.  By calling this function we assume
 // the caller is consuming the new data;
@@ -54,24 +62,45 @@ void AP_GPS_ExternalAHRS::handle_external(const AP_ExternalAHRS::gps_data_messag
     loc.alt = pkt.msl_altitude;
 
     state.location = loc;
-    state.hdop = pkt.hdop;
-    state.vdop = pkt.vdop;
+    state.hdop = external_dop_to_gps_dop(pkt.hdop);
+    state.vdop = external_dop_to_gps_dop(pkt.vdop);
 
-    state.have_vertical_velocity = true;
     state.velocity.x = pkt.ned_vel_north;
     state.velocity.y = pkt.ned_vel_east;
     state.velocity.z = pkt.ned_vel_down;
 
     velocity_to_speed_course(state);
 
-    state.have_speed_accuracy = true;
-    state.have_horizontal_accuracy = true;
-    state.have_vertical_accuracy = true;
-    state.have_vertical_velocity = true;
+    state.have_speed_accuracy = pkt.have_speed_accuracy;
+    state.have_horizontal_accuracy = pkt.have_horizontal_accuracy;
+    state.have_vertical_accuracy = pkt.have_vertical_accuracy;
+    state.have_vertical_velocity = pkt.have_vertical_velocity;
+    state.have_undulation = pkt.have_undulation;
 
     state.horizontal_accuracy = pkt.horizontal_pos_accuracy;
     state.vertical_accuracy = pkt.vertical_pos_accuracy;
-    state.speed_accuracy = pkt.horizontal_vel_accuracy;
+    state.speed_accuracy = pkt.speed_accuracy;
+    state.undulation = pkt.undulation;
+
+    // ExternalAHRS GPS messages do not provide a moving-baseline vector.
+    state.rtk_baseline_coords_type = 0;
+    state.rtk_baseline_x_mm = 0;
+    state.rtk_baseline_y_mm = 0;
+    state.rtk_baseline_z_mm = 0;
+    state.rtk_accuracy = 0;
+    state.rtk_iar_num_hypotheses = 0;
+
+    if (state.status >= AP_GPS::GPS_OK_FIX_3D_RTK_FLOAT) {
+        state.rtk_time_week_ms = pkt.ms_tow;
+        state.rtk_week_number = pkt.gps_week;
+        state.rtk_age_ms = pkt.rtk_age_ms;
+        state.rtk_num_sats = pkt.rtk_num_sats;
+    } else {
+        state.rtk_time_week_ms = 0;
+        state.rtk_week_number = 0;
+        state.rtk_age_ms = 0;
+        state.rtk_num_sats = 0;
+    }
 
     state.last_gps_time_ms = AP_HAL::millis();
 
@@ -89,4 +118,3 @@ bool AP_GPS_ExternalAHRS::get_lag(float &lag_sec) const
 }
 
 #endif // HAL_EXTERNAL_AHRS_ENABLED
-

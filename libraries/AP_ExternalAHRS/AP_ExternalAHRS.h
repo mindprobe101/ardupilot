@@ -149,6 +149,7 @@ public:
         float horizontal_pos_accuracy;
         float vertical_pos_accuracy;
         float horizontal_vel_accuracy;
+        float speed_accuracy;
         float hdop;
         float vdop;
         int32_t  longitude;
@@ -157,6 +158,14 @@ public:
         float  ned_vel_north;
         float  ned_vel_east;
         float  ned_vel_down;
+        float undulation; // AMSL altitude minus WGS84 ellipsoid altitude, metres
+        uint32_t rtk_age_ms;
+        uint8_t rtk_num_sats;
+        bool have_horizontal_accuracy;
+        bool have_vertical_accuracy;
+        bool have_speed_accuracy;
+        bool have_vertical_velocity;
+        bool have_undulation;
     } gps_data_message_t;
 
     typedef struct {
@@ -207,7 +216,7 @@ private:
     uint32_t last_log_ms;
 
     // true when user has disabled the GNSS
-    bool gnss_is_disabled;
+    bool gnss_is_disabled = false;
 };
 
 namespace AP {
@@ -215,4 +224,3 @@ namespace AP {
 };
 
 #endif  // HAL_EXTERNAL_AHRS_ENABLED
-

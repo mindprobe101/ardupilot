@@ -186,7 +186,14 @@ void AP_ExternalAHRS_MicroStrain5::post_filter() const
         ned_vel_north: filter_data.ned_velocity_north,
         ned_vel_east: filter_data.ned_velocity_east,
         ned_vel_down: filter_data.ned_velocity_down,
+
+        have_horizontal_accuracy: true,
+        have_vertical_accuracy: true,
+        have_speed_accuracy: true,
+        have_vertical_velocity: true,
     };
+
+    gps.speed_accuracy = gps.horizontal_vel_accuracy;
 
     if (gps.fix_type >= AP_GPS_FixType::FIX_3D && !state.have_origin) {
         WITH_SEMAPHORE(state.sem);

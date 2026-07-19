@@ -674,7 +674,7 @@ void AP_ExternalAHRS_VectorNav::process_ins_ekf_packet(const uint8_t *b) {
 // process INS mode GNSS packet
 void AP_ExternalAHRS_VectorNav::process_ins_gnss_packet(const uint8_t *b) {
     const struct VN_INS_gnss_packet &pkt = *(struct VN_INS_gnss_packet *)b;
-    AP_ExternalAHRS::gps_data_message_t gps;
+    AP_ExternalAHRS::gps_data_message_t gps {};
 
 
     last_pkt3_ms          = AP_HAL::millis();
@@ -689,6 +689,11 @@ void AP_ExternalAHRS_VectorNav::process_ins_gnss_packet(const uint8_t *b) {
     gps.horizontal_pos_accuracy = pkt.posU1[0];
     gps.vertical_pos_accuracy   = pkt.posU1[2];
     gps.horizontal_vel_accuracy = pkt.velU1;
+    gps.speed_accuracy          = pkt.velU1;
+    gps.have_horizontal_accuracy = true;
+    gps.have_vertical_accuracy   = true;
+    gps.have_speed_accuracy      = true;
+    gps.have_vertical_velocity   = true;
 
     gps.hdop = pkt.dop1[4];
     gps.vdop = pkt.dop1[3];
