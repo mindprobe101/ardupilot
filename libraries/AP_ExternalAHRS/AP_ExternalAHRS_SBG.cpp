@@ -478,45 +478,57 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
             case SBG_ECOM_LOG_EKF_NAV: // 8
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.ekfNav, sizeof(cached.sbg.ekfNav), msg.data, msg.len);
 
-                state.velocity = Vector3f(cached.sbg.ekfNav.velocity[0], cached.sbg.ekfNav.velocity[1], cached.sbg.ekfNav.velocity[2]);
-                state.have_velocity = true;
+                ekf_solution_valid = SbgEkfNav_solution_valid(cached.sbg.ekfNav);
+                last_ekf_nav_ms = now_ms;
 
-                state.location = Location(cached.sbg.ekfNav.position[0]*1e7, cached.sbg.ekfNav.position[1]*1e7, cached.sbg.ekfNav.position[2]*1e2, Location::AltFrame::ABSOLUTE);
-                state.last_location_update_us = AP_HAL::micros();
+                if (ekf_solution_valid) {
+                    state.velocity = Vector3f(cached.sbg.ekfNav.velocity[0], cached.sbg.ekfNav.velocity[1], cached.sbg.ekfNav.velocity[2]);
+                    state.have_velocity = true;
 
-                ekf_is_full_nav = SbgEkfStatus_is_fullNav(cached.sbg.ekfNav.status);
+                    state.location = Location(cached.sbg.ekfNav.position[0]*1e7, cached.sbg.ekfNav.position[1]*1e7, cached.sbg.ekfNav.position[2]*1e2, Location::AltFrame::ABSOLUTE);
+                    state.last_location_update_us = AP_HAL::micros();
 
-                if (!state.have_location && ekf_is_full_nav) {
-                    state.have_location = true;
-                } else if (!state.have_origin && cached.sensors.gps_data.fix_type >= AP_GPS_FixType::FIX_3D && ekf_is_full_nav) {
-                    // this is in an else so that origin doesn't get set on the very very first sample, do it on the second one just to give us a tiny bit more chance of a better origin
-                    state.origin = state.location;
-                    state.have_origin = true;
+                    if (!state.have_location) {
+                        state.have_location = true;
+                    } else if (!state.have_origin && cached.sensors.gps_data.fix_type >= AP_GPS_FixType::FIX_3D) {
+                        // this is in an else so that origin doesn't get set on the very very first sample, do it on the second one just to give us a tiny bit more chance of a better origin
+                        state.origin = state.location;
+                        state.have_origin = true;
+                    }
                 }
 
-                if (ekf_is_full_nav && use_ekf_as_gnss) {
-                    cached.sensors.gps_data.latitude = cached.sbg.ekfNav.position[0] * 1E7;
-                    cached.sensors.gps_data.longitude = cached.sbg.ekfNav.position[1] * 1E7;
-                    cached.sensors.gps_data.msl_altitude = cached.sbg.ekfNav.position[2] * 100;
+                if (use_ekf_as_gnss) {
+                    if (ekf_solution_valid) {
+                        cached.sensors.gps_data.latitude = cached.sbg.ekfNav.position[0] * 1E7;
+                        cached.sensors.gps_data.longitude = cached.sbg.ekfNav.position[1] * 1E7;
+                        cached.sensors.gps_data.msl_altitude = cached.sbg.ekfNav.position[2] * 100;
 
-                    cached.sensors.gps_data.horizontal_pos_accuracy = Vector2f(cached.sbg.ekfNav.positionStdDev[0], cached.sbg.ekfNav.positionStdDev[1]).length();
-                    cached.sensors.gps_data.hdop = cached.sensors.gps_data.horizontal_pos_accuracy;
-                    cached.sensors.gps_data.vertical_pos_accuracy = cached.sbg.ekfNav.positionStdDev[2];
-                    cached.sensors.gps_data.vdop =  cached.sensors.gps_data.vertical_pos_accuracy;
+                        cached.sensors.gps_data.horizontal_pos_accuracy = Vector2f(cached.sbg.ekfNav.positionStdDev[0], cached.sbg.ekfNav.positionStdDev[1]).length();
+                        cached.sensors.gps_data.hdop = cached.sensors.gps_data.horizontal_pos_accuracy;
+                        cached.sensors.gps_data.vertical_pos_accuracy = cached.sbg.ekfNav.positionStdDev[2];
+                        cached.sensors.gps_data.vdop =  cached.sensors.gps_data.vertical_pos_accuracy;
 
-                    cached.sensors.gps_data.fix_type = AP_GPS_FixType::FIX_3D;
+                        cached.sensors.gps_data.fix_type = AP_GPS_FixType::FIX_3D;
 
-                    // keep reporting the receiver's satellite count: the raw GPSx_POS
-                    // handler below is skipped in EKF-as-GNSS mode, and a stale count of
-                    // 0 makes EKF3's NSats quality check reject this GPS forever
-                    cached.sensors.gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed;
+                        // keep reporting the receiver's satellite count: the raw GPSx_POS
+                        // handler below is skipped in EKF-as-GNSS mode, and a stale count of
+                        // 0 makes EKF3's NSats quality check reject this GPS forever
+                        cached.sensors.gps_data.satellites_in_view = cached.sbg.gnssPos.numSvUsed;
 
-                    cached.sensors.gps_data.ned_vel_north = cached.sbg.ekfNav.velocity[0];
-                    cached.sensors.gps_data.ned_vel_east = cached.sbg.ekfNav.velocity[1];
-                    cached.sensors.gps_data.ned_vel_down = cached.sbg.ekfNav.velocity[2];
-                    cached.sensors.gps_data.horizontal_vel_accuracy = Vector2f(cached.sbg.ekfNav.velocityStdDev[0], cached.sbg.ekfNav.velocityStdDev[1]).length();
+                        cached.sensors.gps_data.ned_vel_north = cached.sbg.ekfNav.velocity[0];
+                        cached.sensors.gps_data.ned_vel_east = cached.sbg.ekfNav.velocity[1];
+                        cached.sensors.gps_data.ned_vel_down = cached.sbg.ekfNav.velocity[2];
+                        cached.sensors.gps_data.horizontal_vel_accuracy = Vector2f(cached.sbg.ekfNav.velocityStdDev[0], cached.sbg.ekfNav.velocityStdDev[1]).length();
 
-                    updated_gps = true;
+                        gps_fix_is_from_ekf = true;
+                        updated_gps = true;
+                    } else if (gps_fix_is_from_ekf && cached.sensors.gps_data.fix_type > AP_GPS_FixType::NONE) {
+                        // the fix we have been reporting came from the EKF solution and
+                        // that solution is no longer trustworthy, say so immediately
+                        // instead of letting the last position stand as a 3D fix
+                        cached.sensors.gps_data.fix_type = AP_GPS_FixType::NONE;
+                        updated_gps = true;
+                    }
                 }
                 break;
 
@@ -524,7 +536,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
             case SBG_ECOM_LOG_GPS2_VEL: // 16
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.gnssVel, sizeof(cached.sbg.gnssVel), msg.data, msg.len);
 
-                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_is_full_nav)) {
+                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_solution_valid)) {
                     cached.sensors.gps_data.ms_tow = cached.sbg.gnssVel.timeOfWeek;
                     cached.sensors.gps_data.ned_vel_north = cached.sbg.gnssVel.velocity[0];
                     cached.sensors.gps_data.ned_vel_east = cached.sbg.gnssVel.velocity[1];
@@ -540,7 +552,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
             case SBG_ECOM_LOG_GPS2_POS: // 17
                 safe_copy_msg_to_object((uint8_t*)&cached.sbg.gnssPos, sizeof(cached.sbg.gnssPos), msg.data, msg.len);
 
-                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_is_full_nav)) {
+                if ((!use_ekf_as_gnss) || (use_ekf_as_gnss && !ekf_solution_valid)) {
                     cached.sensors.gps_data.ms_tow = cached.sbg.gnssPos.timeOfWeek;
                     cached.sensors.gps_data.latitude = cached.sbg.gnssPos.latitude * 1E7;
                     cached.sensors.gps_data.longitude = cached.sbg.gnssPos.longitude * 1E7;
@@ -554,6 +566,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                     // unused - cached.sbg.gnssPos.baseStationId
                     // unused - cached.sbg.gnssPos.differentialAge
                     cached.sensors.gps_data.fix_type = SbgGpsPosStatus_to_GpsFixType(cached.sbg.gnssPos.status);
+                    gps_fix_is_from_ekf = false;
                     updated_gps = true;
                 }
                 break;
@@ -651,11 +664,34 @@ void AP_ExternalAHRS_SBG::safe_copy_msg_to_object(uint8_t* dest, const uint16_t 
     memcpy(dest, src, MIN(dest_len,src_len));
 }
 
-bool AP_ExternalAHRS_SBG::SbgEkfStatus_is_fullNav(const uint32_t ekfStatus)
+uint8_t AP_ExternalAHRS_SBG::SbgEkfStatus_solution_mode(const uint32_t ekfStatus)
 {
-    SbgEComSolutionMode solutionMode = (SbgEComSolutionMode)(ekfStatus & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK);
+    return (uint8_t)(ekfStatus & SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK);
+}
 
-    return (solutionMode == SBG_ECOM_SOL_MODE_NAV_POSITION);
+bool AP_ExternalAHRS_SBG::SbgEkfNav_solution_valid(const SbgEComLogEkfNav &nav) const
+{
+    if (SbgEkfStatus_solution_mode(nav.status) != SBG_ECOM_SOL_MODE_NAV_POSITION) {
+        return false;
+    }
+
+    const double lat = nav.position[0];
+    const double lon = nav.position[1];
+    if (!isfinite(lat) || !isfinite(lon) ||
+        (is_zero((float)lat) && is_zero((float)lon)) ||
+        fabs(lat) > 90.0 || fabs(lon) > 180.0) {
+        return false;
+    }
+
+    if (Vector2f(nav.positionStdDev[0], nav.positionStdDev[1]).length() > SBG_EKF_POS_STD_LIMIT_M) {
+        return false;
+    }
+
+    if (Vector3f(nav.velocity[0], nav.velocity[1], nav.velocity[2]).length() > SBG_EKF_VEL_LIMIT_MS) {
+        return false;
+    }
+
+    return true;
 }
 
 AP_GPS_FixType AP_ExternalAHRS_SBG::SbgGpsPosStatus_to_GpsFixType(const uint32_t gpsPosStatus)
@@ -686,6 +722,23 @@ AP_GPS_FixType AP_ExternalAHRS_SBG::SbgGpsPosStatus_to_GpsFixType(const uint32_t
     return AP_GPS_FixType::NONE;
 }
 
+void AP_ExternalAHRS_SBG::update()
+{
+    WITH_SEMAPHORE(state.sem);
+
+    // the EKF_NAV stream is the source of the reported GPS fix, if it stops
+    // while we still claim a valid solution the claim has to be withdrawn.
+    // the UTC time handler keeps pushing the cached GPS data so a stale fix
+    // would otherwise never time out on the AP_GPS side
+    if (ekf_solution_valid && last_ekf_nav_ms != 0 &&
+        AP_HAL::millis() - last_ekf_nav_ms > SBG_EKF_NAV_TIMEOUT_MS) {
+        ekf_solution_valid = false;
+        if (gps_fix_is_from_ekf) {
+            cached.sensors.gps_data.fix_type = AP_GPS_FixType::NONE;
+        }
+    }
+}
+
 void AP_ExternalAHRS_SBG::get_filter_status(nav_filter_status &status) const
 {
     WITH_SEMAPHORE(state.sem);
@@ -698,7 +751,7 @@ void AP_ExternalAHRS_SBG::get_filter_status(nav_filter_status &status) const
         return;
     }
 
-    if (state.have_location) {
+    if (state.have_location && ekf_solution_valid) {
         status.flags.vert_pos = true;
         status.flags.horiz_pos_rel = true;
         status.flags.horiz_pos_abs = true;
@@ -711,7 +764,7 @@ void AP_ExternalAHRS_SBG::get_filter_status(nav_filter_status &status) const
         status.flags.attitude = true;
     }
 
-    if (state.have_velocity) {
+    if (state.have_velocity && ekf_solution_valid) {
         status.flags.vert_vel = true;
         status.flags.horiz_vel = true;
     }

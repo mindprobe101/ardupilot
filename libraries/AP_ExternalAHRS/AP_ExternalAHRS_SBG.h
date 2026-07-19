@@ -45,7 +45,7 @@ public:
     bool get_variances(float &velVar, float &posVar, float &hgtVar, Vector3f &magVar, float &tasVar) const override;
 
     // check for new data
-    void update() override { }
+    void update() override;
 
     // Get model/type name
     const char* get_name() const override { return "SBG"; }
@@ -63,6 +63,12 @@ private:
     static constexpr uint8_t SBG_PACKET_ETX = 0x33;
     static constexpr uint16_t SBG_PACKET_PAYLOAD_SIZE_MAX = 100; // real sbgCom limit is 4086 but the largest packet we parse is SbgEComLogEkfNav=72 bytes
     static constexpr uint16_t SBG_PACKET_OVERHEAD = 9; // sync1, sync2, id, class, lenLSB, lenMSB, crcLSB, crcMSB, etx
+
+    static constexpr uint32_t SBG_EKF_NAV_TIMEOUT_MS = 1000;
+    // healthy flights reported up to 273 m horizontal position std and 12 m/s
+    // during intentional GNSS denial, failed realignments exceeded both by far
+    static constexpr float SBG_EKF_POS_STD_LIMIT_M = 500.0f;
+    static constexpr float SBG_EKF_VEL_LIMIT_MS = 50.0f;
 
     struct Cached {
         struct {
@@ -154,8 +160,11 @@ private:
     static void safe_copy_msg_to_object(uint8_t* dest, const uint16_t dest_len, const uint8_t* src, const uint16_t src_len);
     static uint16_t make_gps_week(const SbgEComLogUtc *utc_data);
 
-    bool ekf_is_full_nav = false;
-    static bool SbgEkfStatus_is_fullNav(const uint32_t ekfStatus);
+    bool ekf_solution_valid = false;
+    uint32_t last_ekf_nav_ms;
+    bool gps_fix_is_from_ekf;
+    static uint8_t SbgEkfStatus_solution_mode(const uint32_t ekfStatus);
+    bool SbgEkfNav_solution_valid(const SbgEComLogEkfNav &nav) const;
 
     static AP_GPS_FixType SbgGpsPosStatus_to_GpsFixType(const uint32_t gpsPosStatus);
 
