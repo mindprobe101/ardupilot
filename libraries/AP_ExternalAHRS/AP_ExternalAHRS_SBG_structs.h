@@ -219,6 +219,35 @@ typedef struct PACKED _SbgEComLogImuShort
 #define SBG_ECOM_LOG_EKF_SOLUTION_MODE_MASK         (0x0000000Fu)       /*!< Mask used to keep only the clock status part. */
 
 /*!
+ * Solution bit masks definitions.
+ */
+#define SBG_ECOM_SOL_ATTITUDE_VALID         (0x00000001u << 4)      /*!< Set if attitude data is reliable (Roll/Pitch error within defined criteria). */
+#define SBG_ECOM_SOL_HEADING_VALID          (0x00000001u << 5)      /*!< Set if heading data is reliable (Heading error within defined criteria). */
+#define SBG_ECOM_SOL_VELOCITY_VALID         (0x00000001u << 6)      /*!< Set if velocity data is reliable (Velocity error within defined criteria). */
+#define SBG_ECOM_SOL_POSITION_VALID         (0x00000001u << 7)      /*!< Set if position data is reliable (Position error within defined criteria). */
+
+#define SBG_ECOM_SOL_VERT_REF_USED          (0x00000001u << 8)      /*!< Set if the vertical reference is used in the solution. */
+#define SBG_ECOM_SOL_MAG_REF_USED           (0x00000001u << 9)      /*!< Set if magnetometer is used in the solution. */
+#define SBG_ECOM_SOL_GPS1_VEL_USED          (0x00000001u << 10)     /*!< Set if GNSS 1 velocity is used in the solution. */
+#define SBG_ECOM_SOL_GPS1_POS_USED          (0x00000001u << 11)     /*!< Set if GNSS 1 position is used in the solution. */
+#define SBG_ECOM_SOL_VEL_CONSTRAINTS_USED   (0x00000001u << 12)     /*!< Set if vehicle velocity constraint is used to improve accuracy. */
+#define SBG_ECOM_SOL_GPS1_HDT_USED          (0x00000001u << 13)     /*!< Set if GNSS 1 true heading is used in the solution. */
+#define SBG_ECOM_SOL_GPS2_VEL_USED          (0x00000001u << 14)     /*!< Set if GNSS 2 velocity is used in the solution. */
+#define SBG_ECOM_SOL_GPS2_POS_USED          (0x00000001u << 15)     /*!< Set if GNSS 2 position is used in the solution. */
+#define SBG_ECOM_SOL_GPS2_HDT_USED          (0x00000001u << 17)     /*!< Set if GNSS 2 true heading is used in the solution. */
+#define SBG_ECOM_SOL_ODO_USED               (0x00000001u << 18)     /*!< Set if odometer velocity is used in the solution. */
+#define SBG_ECOM_SOL_DVL_BT_USED            (0x00000001u << 19)     /*!< Set if DVL bottom tracking velocity is used in the solution. */
+#define SBG_ECOM_SOL_DVL_WT_USED            (0x00000001u << 20)     /*!< Set if DVL water layer velocity is used in the solution. */
+#define SBG_ECOM_SOL_VEL1_USED              (0x00000001u << 21)     /*!< Set if generic velocity 1 is used in the solution. */
+#define SBG_ECOM_SOL_USBL_USED              (0x00000001u << 24)     /*!< Set if USBL position is used in the solution. */
+#define SBG_ECOM_SOL_AIRSPEED_USED          (0x00000001u << 25)     /*!< Set if true airspeed is used in the solution. */
+#define SBG_ECOM_SOL_ZUPT_USED              (0x00000001u << 26)     /*!< Set if a Zero Velocity Update (ZUPT) is is used in the solution. */
+#define SBG_ECOM_SOL_ALIGN_VALID            (0x00000001u << 27)     /*!< Set if sensor alignment and residual sensors errors have fully converged. */
+#define SBG_ECOM_SOL_VERTICAL_AIDING_USED   (0x00000001u << 28)     /*!< Set if a vertical aiding source (depth or barometric altimeter) is used in the solution. */
+#define SBG_ECOM_SOL_ZARU_USED              (0x00000001u << 29)     /*!< Set if a Zero Angular Rate Update (ZARU) is used in the solution. */
+#define SBG_ECOM_SOL_POS1_USED              (0x00000001u << 30)     /*!< Set if generic position 1 is used in the solution. */
+
+/*!
  * Solution filter mode enum.
  */
 typedef enum _SbgEComSolutionMode
