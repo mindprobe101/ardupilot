@@ -101,3 +101,10 @@ env BUILD_ABIN True
 define HAL_INS_HIGHRES_SAMPLE 6
 
 define AP_NETWORKING_BACKEND_PPP 1
+
+# this vehicle only ever talks to an SBG unit, drop the other external
+# AHRS backends to free flash
+define AP_EXTERNAL_AHRS_MICROSTRAIN5_ENABLED 0
+define AP_EXTERNAL_AHRS_MICROSTRAIN7_ENABLED 0
+define AP_EXTERNAL_AHRS_VECTORNAV_ENABLED 0
+define AP_EXTERNAL_AHRS_INERTIALLABS_ENABLED 0
