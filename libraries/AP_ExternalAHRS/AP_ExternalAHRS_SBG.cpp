@@ -370,6 +370,7 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
     bool updated_airspeed = false;
     int16_t announce_mode = -1;
     int8_t announce_pos_used = -1;
+    int8_t announce_valid = -1;
 
     {
         WITH_SEMAPHORE(state.sem);
@@ -503,6 +504,16 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
                         last_aiding_msg_ms = now_ms;
                         announce_pos_used = pos_used ? 1 : 0;
                     }
+                }
+                // a solution can also become untrustworthy while the mode
+                // still claims full navigation, the mode message above will
+                // not fire for that so report it separately
+                if (now_ms - last_valid_msg_ms >= 5000 &&
+                    SbgEkfStatus_solution_mode(cached.sbg.ekfNav.status) == SBG_ECOM_SOL_MODE_NAV_POSITION &&
+                    ekf_solution_valid != last_reported_solution_valid) {
+                    last_reported_solution_valid = ekf_solution_valid;
+                    last_valid_msg_ms = now_ms;
+                    announce_valid = ekf_solution_valid ? 1 : 0;
                 }
 
                 if (ekf_solution_valid) {
@@ -668,6 +679,11 @@ void AP_ExternalAHRS_SBG::handle_msg(const sbgMessage &msg)
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: GNSS position used");
     } else if (announce_pos_used == 0) {
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: GNSS position rejected");
+    }
+    if (announce_valid == 1) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SBG: EKF solution accepted");
+    } else if (announce_valid == 0) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SBG: EKF solution rejected");
     }
 
 #if AP_GPS_ENABLED
