@@ -70,9 +70,31 @@
 #define ZHIANN_FRAME_CELL_15_18   0x06
 #define ZHIANN_FRAME_CELL_23_24   0x09
 #define ZHIANN_FRAME_PACK_VOLT    0x10
-// internal tag for the 0x401A100+n frame; outside the 5-bit wire range
-// so it can never collide with a real block frame type
+// internal tags; outside the 5-bit wire range so they can never collide
+// with a real block frame type
 #define ZHIANN_FRAME_SOC_COARSE   0xFF
+#define ZHIANN_FRAME_ALARM        0xFE
+
+// spec J1939-style frames: id = P<<26 | PF<<16 | PS<<8 | SA
+#define ZHIANN_PF(id)             (((id) >> 16) & 0xFFU)
+#define ZHIANN_PF_ALARM           0x24U
+// master heartbeat (PF 0x43): dest 0xFF broadcast, our source addr 0xF0,
+// priority 6, sent every 2s per the vendor spec keep-alive requirement
+#define ZHIANN_HEARTBEAT_ID       ((6UL << 26) | (0x43UL << 16) | (0xFFUL << 8) | 0xF0UL)
+#define ZHIANN_HEARTBEAT_MS       2000
+
+// alarm frame bit definitions (same layout in alarm and warning words)
+#define ZHIANN_ALARM_CHG_OVERCURRENT   (1U << 0)
+#define ZHIANN_ALARM_TEMP_SENSOR       (1U << 8)
+#define ZHIANN_ALARM_CELL_OVERVOLT     (1U << 9)
+#define ZHIANN_ALARM_CELL_UNDERVOLT    (1U << 10)
+#define ZHIANN_ALARM_HIGH_TEMP         (1U << 11)
+#define ZHIANN_ALARM_LOW_TEMP          (1U << 12)
+#define ZHIANN_ALARM_AFE_FAULT         (1U << 13)
+#define ZHIANN_ALARM_BATT_DAMAGED      (1U << 14)
+#define ZHIANN_ALARM_DIS_OVERCURRENT   (1U << 15)
+// alarms that make the battery unsafe to arm on
+#define ZHIANN_ALARM_SEVERE  (ZHIANN_ALARM_BATT_DAMAGED | ZHIANN_ALARM_AFE_FAULT)
 
 // consider the BMS gone after the codebase-wide battery timeout
 #define ZHIANN_TIMEOUT_US      (AP_BATT_MONITOR_TIMEOUT * 1000ULL)
@@ -102,6 +124,8 @@ const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 MultiCAN *AP_BattMonitor_ZhiannBMS::_multican;
 AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_instances[AP_BATT_MONITOR_MAX_INSTANCES];
 uint8_t AP_BattMonitor_ZhiannBMS::_num_instances;
+uint32_t AP_BattMonitor_ZhiannBMS::_last_heartbeat_ms;
+uint16_t AP_BattMonitor_ZhiannBMS::_nodes_seen;
 
 // cell-voltage frame map: frame type -> first cell, payload offset, count
 static const struct {
@@ -178,6 +202,27 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
     }
     const uint32_t id = frame.id & AP_HAL::CANFrame::MaskExtID;
 
+    // BMS alarm frame (PF 0x24, spec 6.8): never observed on the healthy
+    // bench bus, listened for opportunistically. SA carries the pack node
+    // in the broadcast profile; an unattributable alarm goes to every
+    // instance - over-reporting a battery fault beats missing one
+    if (ZHIANN_PF(id) == ZHIANN_PF_ALARM && frame.dlc >= 4) {
+        const uint8_t sa = id & 0xFF;
+        bool attributed = false;
+        for (uint8_t i = 0; i < _num_instances; i++) {
+            if (_instances[i]->matches_node(sa)) {
+                _instances[i]->handle_pack_frame(ZHIANN_FRAME_ALARM, frame);
+                attributed = true;
+            }
+        }
+        if (!attributed) {
+            for (uint8_t i = 0; i < _num_instances; i++) {
+                _instances[i]->handle_pack_frame(ZHIANN_FRAME_ALARM, frame);
+            }
+        }
+        return true;
+    }
+
     uint8_t node;
     uint8_t frame_type;
     if (id >= ZHIANN_BLOCK_BASE &&
@@ -207,6 +252,7 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
     } else {
         return false;
     }
+    _nodes_seen |= (1U << node);
 
     // pass 1: an instance already bound to this node (explicit serial
     // or previously auto-bound)
@@ -292,6 +338,12 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         }
         break;
 
+    case ZHIANN_FRAME_ALARM:
+        _alarm_bits = le16toh_ptr(&frame.data[0]);
+        _warning_bits = frame.dlc >= 4 ? le16toh_ptr(&frame.data[2]) : 0;
+        _alarm_ms = AP_HAL::millis();
+        break;
+
     default:
         for (const auto &m : zhiann_cell_map) {
             if (m.frame_type == frame_type) {
@@ -305,8 +357,36 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
     }
 }
 
+// spec keep-alive: the drone-profile packs currently broadcast without it,
+// but per spec 2.4 a BMS may stop transmitting after 20 min without a
+// master heartbeat; sending it was bench-verified to be side-effect free
+void AP_BattMonitor_ZhiannBMS::send_heartbeat()
+{
+    const uint32_t now_ms = AP_HAL::millis();
+    if (now_ms - _last_heartbeat_ms < ZHIANN_HEARTBEAT_MS ||
+        _multican == nullptr || !_multican->initialized()) {
+        return;
+    }
+    _last_heartbeat_ms = now_ms;
+
+    AP_HAL::CANFrame out;
+    out.id = ZHIANN_HEARTBEAT_ID | AP_HAL::CANFrame::FlagEFF;
+    out.dlc = 8;
+    memset(out.data, 0, sizeof(out.data));
+    // pre-registered + registered bitmaps: the pack nodes heard on the bus
+    const uint32_t bitmap = _nodes_seen;
+    put_le32_ptr(&out.data[0], bitmap);
+    put_le32_ptr(&out.data[4], bitmap);
+    (void)_multican->write_frame(out, 5000);
+}
+
 void AP_BattMonitor_ZhiannBMS::read()
 {
+    // one heartbeat stream for the whole bus, owned by the first instance
+    if (_instances[0] == this) {
+        send_heartbeat();
+    }
+
     WITH_SEMAPHORE(_sem);
 
     // 64-bit micros: no wraparound resurrection after long silence
@@ -342,6 +422,37 @@ void AP_BattMonitor_ZhiannBMS::read()
     _has_cell_voltages = _cells_seen;
     _has_temperature = (_interim_state.temperature_time != 0) &&
         ((AP_HAL::millis() - _interim_state.temperature_time) <= AP_BATT_MONITOR_TIMEOUT);
+
+    // publish faults from the BMS alarm frame; alarm state expires with
+    // the standard battery timeout once the frames stop
+    uint32_t faults = 0;
+    if (_alarm_ms != 0 &&
+        (AP_HAL::millis() - _alarm_ms) <= AP_BATT_MONITOR_TIMEOUT) {
+        const uint16_t a = _alarm_bits;
+        if (a & (ZHIANN_ALARM_DIS_OVERCURRENT | ZHIANN_ALARM_CHG_OVERCURRENT)) {
+            faults |= MAV_BATTERY_FAULT_OVER_CURRENT;
+        }
+        if (a & ZHIANN_ALARM_HIGH_TEMP) {
+            faults |= MAV_BATTERY_FAULT_OVER_TEMPERATURE;
+        }
+        if (a & ZHIANN_ALARM_LOW_TEMP) {
+            faults |= MAV_BATTERY_FAULT_UNDER_TEMPERATURE;
+        }
+        if (a & ZHIANN_ALARM_CELL_UNDERVOLT) {
+            faults |= MAV_BATTERY_FAULT_DEEP_DISCHARGE;
+        }
+        if (a & ZHIANN_ALARM_CELL_OVERVOLT) {
+            faults |= MAV_BATTERY_FAULT_SPIKES;
+        }
+        if (a & (ZHIANN_ALARM_SEVERE | ZHIANN_ALARM_TEMP_SENSOR)) {
+            faults |= MAV_BATTERY_FAULT_CELL_FAIL;
+        }
+        // a damaged battery or dead AFE must not pass arming
+        if (a & ZHIANN_ALARM_SEVERE) {
+            _state.healthy = false;
+        }
+    }
+    _fault_bitmask = faults;
 }
 
 bool AP_BattMonitor_ZhiannBMS::capacity_remaining_pct(uint8_t &percentage) const

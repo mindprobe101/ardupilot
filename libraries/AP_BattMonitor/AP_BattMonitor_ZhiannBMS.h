@@ -23,6 +23,9 @@ public:
     // BMS-reported SOC when available, else base-class coulomb count
     bool capacity_remaining_pct(uint8_t &percentage) const override;
 
+    // faults decoded from the BMS alarm frame (PF 0x24)
+    uint32_t get_mavlink_fault_bitmask() const override { return _fault_bitmask; }
+
     static const struct AP_Param::GroupInfo var_info[];
 
 private:
@@ -42,10 +45,16 @@ private:
 
     void store_cells(uint8_t first_cell, const uint8_t *data, uint8_t ncells);
 
+    // spec keep-alive: master heartbeat (PF 0x43) every 2s, sent by the
+    // first instance on behalf of all
+    void send_heartbeat();
+
     // all instances share one MultiCAN (registered by the first instance)
     static MultiCAN *_multican;
     static AP_BattMonitor_ZhiannBMS *_instances[AP_BATT_MONITOR_MAX_INSTANCES];
     static uint8_t _num_instances;
+    static uint32_t _last_heartbeat_ms;
+    static uint16_t _nodes_seen;    // bitmap of pack nodes heard on the bus
 
     AP_Float _curr_mult;
 
@@ -60,12 +69,16 @@ private:
     AP_BattMonitor::BattMonitor_State _interim_state {};
     uint64_t _last_frame_us;        // 64-bit: liveness check cannot wrap
     uint32_t _fine_soc_ms;          // last 0.1%-resolution SOC frame
+    uint32_t _alarm_ms;             // last alarm frame (PF 0x24)
+    uint16_t _alarm_bits;
+    uint16_t _warning_bits;
     uint8_t _soc_pct;
     bool _soc_valid;
     bool _cells_seen;
     bool _current_seen;
 
     // copies published by read() for lock-free main-thread accessors
+    uint32_t _fault_bitmask;
     uint8_t _soc_pct_pub;
     bool _soc_valid_pub;
     bool _has_current;
