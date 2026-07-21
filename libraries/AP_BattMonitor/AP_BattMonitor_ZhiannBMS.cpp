@@ -78,10 +78,14 @@
 // spec J1939-style frames: id = P<<26 | PF<<16 | PS<<8 | SA
 #define ZHIANN_PF(id)             (((id) >> 16) & 0xFFU)
 #define ZHIANN_PF_ALARM           0x24U
-// master heartbeat (PF 0x43): dest 0xFF broadcast, our source addr 0xF0,
-// priority 6, sent every 2s per the vendor spec keep-alive requirement
-#define ZHIANN_HEARTBEAT_ID       ((6UL << 26) | (0x43UL << 16) | (0xFFUL << 8) | 0xF0UL)
-#define ZHIANN_HEARTBEAT_MS       2000
+
+// NOTE: do NOT transmit the spec master heartbeat (PF 0x43) to these
+// packs. Field-tested 2026-07-21: a continuous heartbeat whose
+// registered-bitmap omits a momentarily-silent pack makes that pack
+// release its node address and re-join on an already-taken node,
+// colliding IDs with another pack; the packs also power-managed
+// themselves off when heartbeats appeared. The drone-profile packs
+// broadcast fine without any heartbeat.
 
 // alarm frame bit definitions (same layout in alarm and warning words)
 #define ZHIANN_ALARM_CHG_OVERCURRENT   (1U << 0)
@@ -124,8 +128,6 @@ const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 MultiCAN *AP_BattMonitor_ZhiannBMS::_multican;
 AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_instances[AP_BATT_MONITOR_MAX_INSTANCES];
 uint8_t AP_BattMonitor_ZhiannBMS::_num_instances;
-uint32_t AP_BattMonitor_ZhiannBMS::_last_heartbeat_ms;
-uint16_t AP_BattMonitor_ZhiannBMS::_nodes_seen;
 
 // cell-voltage frame map: frame type -> first cell, payload offset, count
 static const struct {
@@ -252,7 +254,6 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
     } else {
         return false;
     }
-    _nodes_seen |= (1U << node);
 
     // pass 1: an instance already bound to this node (explicit serial
     // or previously auto-bound)
@@ -357,36 +358,8 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
     }
 }
 
-// spec keep-alive: the drone-profile packs currently broadcast without it,
-// but per spec 2.4 a BMS may stop transmitting after 20 min without a
-// master heartbeat; sending it was bench-verified to be side-effect free
-void AP_BattMonitor_ZhiannBMS::send_heartbeat()
-{
-    const uint32_t now_ms = AP_HAL::millis();
-    if (now_ms - _last_heartbeat_ms < ZHIANN_HEARTBEAT_MS ||
-        _multican == nullptr || !_multican->initialized()) {
-        return;
-    }
-    _last_heartbeat_ms = now_ms;
-
-    AP_HAL::CANFrame out;
-    out.id = ZHIANN_HEARTBEAT_ID | AP_HAL::CANFrame::FlagEFF;
-    out.dlc = 8;
-    memset(out.data, 0, sizeof(out.data));
-    // pre-registered + registered bitmaps: the pack nodes heard on the bus
-    const uint32_t bitmap = _nodes_seen;
-    put_le32_ptr(&out.data[0], bitmap);
-    put_le32_ptr(&out.data[4], bitmap);
-    (void)_multican->write_frame(out, 5000);
-}
-
 void AP_BattMonitor_ZhiannBMS::read()
 {
-    // one heartbeat stream for the whole bus, owned by the first instance
-    if (_instances[0] == this) {
-        send_heartbeat();
-    }
-
     WITH_SEMAPHORE(_sem);
 
     // 64-bit micros: no wraparound resurrection after long silence

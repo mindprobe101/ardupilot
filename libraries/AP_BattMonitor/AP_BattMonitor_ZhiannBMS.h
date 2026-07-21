@@ -45,16 +45,10 @@ private:
 
     void store_cells(uint8_t first_cell, const uint8_t *data, uint8_t ncells);
 
-    // spec keep-alive: master heartbeat (PF 0x43) every 2s, sent by the
-    // first instance on behalf of all
-    void send_heartbeat();
-
     // all instances share one MultiCAN (registered by the first instance)
     static MultiCAN *_multican;
     static AP_BattMonitor_ZhiannBMS *_instances[AP_BATT_MONITOR_MAX_INSTANCES];
     static uint8_t _num_instances;
-    static uint32_t _last_heartbeat_ms;
-    static uint16_t _nodes_seen;    // bitmap of pack nodes heard on the bus
 
     AP_Float _curr_mult;
 
