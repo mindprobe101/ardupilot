@@ -66,6 +66,10 @@ private:
     uint32_t _alarm_ms;             // last alarm frame (PF 0x24)
     uint16_t _alarm_bits;
     uint16_t _warning_bits;
+    // duplicate-node detection: a lone pack sends its status frame every
+    // ~500ms; sub-300ms arrivals mean two packs share this node
+    uint32_t _last_volt_ms;
+    uint8_t _dup_score;
     uint8_t _soc_pct;
     bool _soc_valid;
     bool _cells_seen;
@@ -73,6 +77,8 @@ private:
 
     // copies published by read() for lock-free main-thread accessors
     uint32_t _fault_bitmask;
+    uint32_t _dup_warn_ms;
+    bool _dup_active;
     uint8_t _soc_pct_pub;
     bool _soc_valid_pub;
     bool _has_current;
