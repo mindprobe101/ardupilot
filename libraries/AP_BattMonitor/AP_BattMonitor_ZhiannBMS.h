@@ -5,6 +5,7 @@
 #if AP_BATTERY_ZHIANNBMS_ENABLED
 
 #include "AP_BattMonitor_Backend.h"
+#include "AP_BattMonitor_ZhiannBMS_decode.h"
 #include <AP_CANManager/AP_CANSensor.h>
 
 class AP_BattMonitor_ZhiannBMS : public AP_BattMonitor_Backend {
@@ -36,6 +37,12 @@ private:
     // returns true if this instance is bound to the given pack node
     bool matches_node(uint8_t node) const;
 
+    // node this instance is bound to, for operator messages
+    int8_t bound_node() const {
+        const int32_t serial = _params._serial_number.get();
+        return serial >= 0 ? (int8_t)serial : _auto_node;
+    }
+
     // returns true if any instance explicitly selects this node via
     // BATTn_SERIAL_NUM
     static bool node_claimed(uint8_t node);
@@ -45,10 +52,15 @@ private:
 
     void store_cells(uint8_t first_cell, const uint8_t *data, uint8_t ncells);
 
+    // ZBMS/ZBC1/ZBC2 dataflash messages, 2Hz per instance from read()
+    void log_zbms();
+
     // all instances share one MultiCAN (registered by the first instance)
     static MultiCAN *_multican;
     static AP_BattMonitor_ZhiannBMS *_instances[AP_BATT_MONITOR_MAX_INSTANCES];
     static uint8_t _num_instances;
+    static uint16_t _nodes_announced;   // fleet inventory: one GCS info per node
+    static uint32_t _unmapped_warn_ms;  // rate limit for unmapped-node warning
 
     AP_Float _curr_mult;
 
@@ -62,14 +74,19 @@ private:
     // by read()
     AP_BattMonitor::BattMonitor_State _interim_state {};
     uint64_t _last_frame_us;        // 64-bit: liveness check cannot wrap
+    uint32_t _last_soc_ms;          // last SOC frame of any kind: still set
+                                    // in standby, when detail frames stop
     uint32_t _fine_soc_ms;          // last 0.1%-resolution SOC frame
+    uint16_t _cells24[24];          // full cell set for ZBC1/ZBC2 logging
+                                    // (the state array caps at 12/14)
+    uint16_t _soc_frame_vmir;       // voltage mirror from the SOC frame
+    float _temp1_c, _temp2_c;       // both sensors (state gets the max)
+    uint8_t _cell_count;            // as reported in frame +0x02
     uint32_t _alarm_ms;             // last alarm frame (PF 0x24)
     uint16_t _alarm_bits;
     uint16_t _warning_bits;
-    // duplicate-node detection: a lone pack sends its status frame every
-    // ~500ms; sub-300ms arrivals mean two packs share this node
-    uint32_t _last_volt_ms;
-    uint8_t _dup_score;
+    // duplicate-node detection over PACK_VOLT frame arrival intervals
+    ZhiannBMS::DupDetector _dup;
     uint8_t _soc_pct;
     bool _soc_valid;
     bool _cells_seen;
@@ -78,7 +95,10 @@ private:
     // copies published by read() for lock-free main-thread accessors
     uint32_t _fault_bitmask;
     uint32_t _dup_warn_ms;
+    uint32_t _standby_warn_ms;
+    uint32_t _last_log_ms;
     bool _dup_active;
+    bool _standby;
     uint8_t _soc_pct_pub;
     bool _soc_valid_pub;
     bool _has_current;
