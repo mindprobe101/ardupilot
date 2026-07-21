@@ -51,6 +51,7 @@
 #include <AP_BoardConfig/AP_BoardConfig.h>
 #include <AP_HAL/AP_HAL.h>
 #include <AP_HAL/utility/sparse-endian.h>
+#include <GCS_MAVLink/GCS.h>
 
 #include <string.h>
 
@@ -298,6 +299,20 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
     case ZHIANN_FRAME_PACK_VOLT:
         if (frame.dlc >= 4) {
             const uint64_t now_us = AP_HAL::micros64();
+
+            // duplicate-node detection: two packs interleaved on one node
+            // deliver this ~500ms frame at sub-300ms spacing
+            const uint32_t now_ms = AP_HAL::millis();
+            if (_last_volt_ms != 0) {
+                const uint32_t dt_ms = now_ms - _last_volt_ms;
+                if (dt_ms < 300) {
+                    _dup_score = MIN(_dup_score + 2, 20);
+                } else if (dt_ms >= 400 && _dup_score > 0) {
+                    _dup_score--;
+                }
+            }
+            _last_volt_ms = now_ms;
+
             _interim_state.voltage = le16toh_ptr(&frame.data[2]) * 0.01f;
             if (frame.dlc >= 8) {
                 // BMS sign convention is discharge-negative; ArduPilot's
@@ -395,6 +410,26 @@ void AP_BattMonitor_ZhiannBMS::read()
     _has_cell_voltages = _cells_seen;
     _has_temperature = (_interim_state.temperature_time != 0) &&
         ((AP_HAL::millis() - _interim_state.temperature_time) <= AP_BATT_MONITOR_TIMEOUT);
+
+    // two packs sharing this node interleave their data: readings are a
+    // physically meaningless mixture, so report unhealthy and tell the
+    // operator why (with hysteresis so a single glitch does not flap)
+    if (!_dup_active && _dup_score >= 10) {
+        _dup_active = true;
+    } else if (_dup_active && _dup_score <= 3) {
+        _dup_active = false;
+    }
+    if (_dup_active) {
+        _state.healthy = false;
+        const uint32_t now_ms = AP_HAL::millis();
+        if (now_ms - _dup_warn_ms > 30000) {
+            _dup_warn_ms = now_ms;
+            const int32_t serial = _params._serial_number.get();
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "ZhiannBMS: duplicate pack on node %d",
+                          int(serial >= 0 ? serial : _auto_node));
+        }
+    }
 
     // publish faults from the BMS alarm frame; alarm state expires with
     // the standard battery timeout once the frames stop
