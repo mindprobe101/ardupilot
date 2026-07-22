@@ -1,1 +1,7 @@
-define AP_SCRIPTING_ENABLED 0
+# flash recovery: disable ExternalAHRS backends of brands not used on
+# this platform (SBG is the only external AHRS in use; scripting stays
+# enabled per operator requirement)
+define AP_EXTERNAL_AHRS_VECTORNAV_ENABLED 0
+define AP_EXTERNAL_AHRS_MICROSTRAIN5_ENABLED 0
+define AP_EXTERNAL_AHRS_MICROSTRAIN7_ENABLED 0
+define AP_EXTERNAL_AHRS_INERTIALLABS_ENABLED 0
