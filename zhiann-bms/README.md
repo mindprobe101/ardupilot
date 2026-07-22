@@ -11,8 +11,12 @@ On `Copter-4.6.3-zhiann-bms` the driver was `BATT_MONITOR=30`. Upstream
 TIBQ76952), so on this branch the driver is **`BATT_MONITOR=33`**.
 Operators upgrading from the 4.6.3 firmware MUST set every
 `BATTn_MONITOR` that was 30 to 33 (see the updated `params-*.param`
-templates) and reboot; a value of 30 on 4.7 selects the INA3221 I2C
-backend, not the Zhiann driver. `CAN_Dx_PROTOCOL=15` and
+templates) and reboot. A stored value of 30 on 4.7 selects the INA3221
+I2C backend, which is not compiled into this CubeOrangePlus build: the
+instance allocates no backend at all, pre-arm fails with
+"Battery N unhealthy", and that pack has no telemetry and no battery
+failsafes until the parameter is corrected. There is deliberately no
+automatic conversion in the firmware. `CAN_Dx_PROTOCOL=15` and
 `BATTn_SERIAL_NUM` semantics are unchanged.
 
 - `arducopter-CubeOrangePlus.apj` — flash with

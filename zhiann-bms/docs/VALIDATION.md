@@ -56,3 +56,42 @@ Validation date: 2026-07-22. Reviewed base: ArduCopter 4.6.3 branch commit
 - Invalid/duplicate mappings fail safe as unhealthy but diagnostics are generic.
 - The current scale is nominal, alarms remain unbenchmarked, and 304 bytes of
   flash headroom is not suitable for unreviewed feature growth.
+
+## Copter-4.7.0 port validation (2026-07-22)
+
+Everything above describes the 4.6.3-branch review and remains the bench
+record. This branch is the tag `Copter-4.7.0` plus the same driver commits;
+the notes below supersede the 4.6.3-specific figures.
+
+- Port fidelity: the driver, decode header and decode tests are byte-identical
+  to the 4.6.3 branch (empty diff). Integration wiring uses `BATT_MONITOR=33`
+  (upstream 4.7 assigned 30/31/32 to INA3221, Analog Current Only and
+  TIBQ76952) and the unchanged `CAN_Dx_PROTOCOL=15`, which upstream still
+  leaves uncontended.
+- Independent rerun on this branch: 29/29 decode tests, SITL build, and a
+  byte-identical CubeOrangePlus rebuild matching `../FIRMWARE-MANIFEST.md`
+  with 247,028 bytes of flash free — the 304-byte margin noted above applied
+  only to the 4.6.3 build.
+- A function-level diff of every front-end contract between the two tags found
+  no behavioral change: 10 Hz `battery.read()` scheduling; the `voltage > 0`
+  guard on low/critical voltage failsafes; `has_current()` gating of capacity
+  failsafes; the 5 s unhealthy timeout; arming-check flow and texts;
+  BATTERY_STATUS cell redistribution and the all-instances round-robin;
+  `CANSensor` system-initialized gating and driver-slot allocation; every
+  stored `BATTn_*` parameter index, including `CURR_MULT` at backend index 30
+  which still aliases DroneCAN's identical entry; and the 64-character logger
+  label limit that the ZBMS message uses exactly.
+- The one migration hazard is the stored-parameter value change described in
+  the README: `BATTn_MONITOR=30` left over from 4.6.3 allocates no backend on
+  this build (INA3221 is not compiled in), so the instance fails pre-arm as
+  "Battery N unhealthy" with no telemetry and no battery failsafes until the
+  parameter is set to 33. Loud but misleading; apply the params template
+  before first flight.
+- Watch items for future upstream merges: reject any change that repurposes
+  battery backend parameter index 30; and if the MAVLink logging backend
+  (`LOG_BACKEND_TYPE` bit 2) is ever enabled, set `LOG_MAV_RATEMAX=0`,
+  because its default became 10 Hz in 4.7 and the five instances share each
+  ZBMS/ZBC1/ZBC2 message id.
+- 4.7 replaced `ARMING_CHECK` with the inverted skip-mask `ARMING_SKIPCHK`
+  (one-time faithful conversion at first boot); update any GCS preset files
+  or scripts that still write the old parameter.
