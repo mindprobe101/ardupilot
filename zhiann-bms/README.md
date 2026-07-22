@@ -30,8 +30,8 @@ modify or rebuild it without rechecking flash use and artifact provenance.
 
 ## Building firmware for this integration
 
-Configure with the extra hwdef to disable Lua scripting (unused on this
-platform; frees ~180 KB flash — without it the image no longer fits):
+Configure with the extra hwdef (disables the unused non-SBG ExternalAHRS
+backends to fit flash; Lua scripting stays enabled):
 
     ./waf configure --board CubeOrangePlus --extra-hwdef=zhiann-bms/extra-hwdef.dat
     ./waf copter
