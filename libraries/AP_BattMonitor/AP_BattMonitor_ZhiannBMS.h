@@ -55,9 +55,13 @@ private:
     // process one frame from this instance's pack (CAN driver thread)
     void handle_pack_frame(uint8_t frame_type, AP_HAL::CANFrame &frame);
 
-    // Initialize the current integrator from BMS SOC, then raise its consumed
-    // floor when SOC falls without erasing calibrated-current integration.
+    // Raise the consumed floor when BMS SOC implies more use than the
+    // current integral, without ever erasing calibrated-current integration.
     void reconcile_consumption(uint16_t soc_tenths);
+
+    // one-time GCS audit of static configuration errors, from the first
+    // read() call of any instance
+    static void announce_misconfiguration();
 
     // mark all configured instances unsafe while an extra physical pack is
     // broadcasting without a battery-monitor mapping
@@ -72,6 +76,7 @@ private:
     static uint8_t _num_instances;
     static uint16_t _nodes_announced;   // fleet inventory: one GCS info per node
     static uint32_t _unmapped_warn_ms[ZhiannBMS::MAX_NODE + 1];
+    static bool _misconfig_checked;     // one-time configuration audit done
 
     AP_Float _curr_mult;
 
@@ -107,13 +112,15 @@ private:
     uint32_t _warning_ms = 0;
     uint16_t _alarm_bits = 0;
     uint16_t _warning_bits = 0;
-    bool _severe_alarm_latched = false; // cleared only by an explicit clear frame
+    uint32_t _current_warn_ms = 0;  // rate limit: implausible current
+    uint32_t _temp_warn_ms = 0;     // rate limit: both temp sensors bad
+    uint32_t _cellcount_warn_ms = 0; // rate limit: cell count != 24
     // duplicate-node detection over PACK_VOLT frame arrival intervals
     ZhiannBMS::DupDetector _dup;
     uint8_t _soc_pct = 0;
     bool _soc_valid = false;
     bool _current_seen = false;
-    bool _consumption_seeded = false;
+    bool _current_fault = false;    // last PACK current was implausible
 
     // copies published by read() for lock-free main-thread accessors
     uint32_t _fault_bitmask = 0;
@@ -121,6 +128,7 @@ private:
     uint32_t _standby_warn_ms = 0;
     uint32_t _unmapped_ms = 0;
     uint32_t _coherence_warn_ms = 0;
+    uint32_t _alarm_gcs_ms = 0;     // rate limit: active-alarm operator message
     uint32_t _last_log_ms = 0;
     bool _dup_active = false;
     bool _standby = false;

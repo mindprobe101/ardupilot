@@ -68,14 +68,16 @@ inline bool classify(uint32_t id, Classified &out)
         out.type = FRAME_SOC_COARSE;
         return true;
     }
-    // Vendor-standard alarm PGN: priority 6, R/DP zero, PF 0x24,
-    // controller destination 0xF0..0xFE, BMS source address 0x00..0xEF
-    // (including the vendor protocol's random-address range 0x80..0xEF).
+    // Vendor-standard alarm PGN: any priority, R/DP zero, PF 0x24,
+    // destination either the null address 0x00 or the controller class
+    // 0xF0..0xFF, BMS source address 0x00..0xEF (including the vendor
+    // protocol's random-address range 0x80..0xEF). Alarm delivery must not
+    // hinge on unverified priority or exact-destination assumptions.
     // The source address is not necessarily the proprietary broadcast node.
     const uint8_t ps = (id >> 8) & 0xFF;
     const uint8_t sa = id & 0xFF;
-    if ((id & 0x1FFF0000UL) == 0x18240000UL &&
-        ps >= 0xF0 && ps <= 0xFE && sa <= 0xEF) {
+    if ((id & 0x03FF0000UL) == 0x00240000UL &&
+        (ps == 0x00 || ps >= 0xF0) && sa <= 0xEF) {
         out.node = sa;
         out.type = FRAME_ALARM;
         return true;
@@ -100,7 +102,6 @@ inline uint8_t expected_dlc(uint8_t frame_type)
     case FRAME_CELL_11_14:
     case FRAME_CELL_15_18:
     case FRAME_PACK_VOLT:
-    case FRAME_ALARM:
     case FRAME_SOC_COARSE:
         return 8;
     default:
@@ -110,6 +111,11 @@ inline uint8_t expected_dlc(uint8_t frame_type)
 
 inline bool valid_dlc(uint8_t frame_type, uint8_t dlc)
 {
+    if (frame_type == FRAME_ALARM) {
+        // both alarm words live in bytes 0-3; a shorter-than-spec alarm
+        // frame must still be heard rather than dropped on frame length
+        return dlc >= 4 && dlc <= 8;
+    }
     const uint8_t expected = expected_dlc(frame_type);
     return expected != 0 && dlc == expected;
 }
@@ -183,10 +189,30 @@ inline float consumed_mah_from_soc(float capacity_mah, uint16_t soc_tenths)
 }
 
 inline float reconciled_consumed_mah(float integrated_mah, float capacity_mah,
-                                     uint16_t soc_tenths, bool already_seeded)
+                                     uint16_t soc_tenths)
 {
+    // Monotonic floor: SOC-derived consumption may raise the integrated
+    // total but never lower it, including when the integrator re-seeds
+    // after a session reset.
     const float soc_mah = consumed_mah_from_soc(capacity_mah, soc_tenths);
-    return !already_seeded || soc_mah > integrated_mah ? soc_mah : integrated_mah;
+    return soc_mah > integrated_mah ? soc_mah : integrated_mah;
+}
+
+// choose the hotter of the plausible sensors; false when both are implausible
+inline bool select_temperature(float t1, float t2, float &out)
+{
+    const bool t1_ok = temperature_valid(t1);
+    const bool t2_ok = temperature_valid(t2);
+    if (t1_ok && t2_ok) {
+        out = t1 > t2 ? t1 : t2;
+    } else if (t1_ok) {
+        out = t1;
+    } else if (t2_ok) {
+        out = t2;
+    } else {
+        return false;
+    }
+    return true;
 }
 
 inline bool pack_cells_coherent(float pack_voltage, const uint16_t *cells,
@@ -304,6 +330,9 @@ public:
                 if (_clean_intervals < 5) {
                     _clean_intervals++;
                 }
+            } else if (dt > 750 && dt <= 1250) {
+                // a single lost ~500ms frame: neither collision evidence
+                // nor a clean interval, so hold qualification progress
             } else {
                 _clean_intervals = 0;
             }
@@ -333,23 +362,32 @@ private:
     bool _active = false;
 };
 
-// A mismatch is strong collision evidence and activates immediately. Require
-// a run of clean independent checks before clearing so alternating mixed and
-// coherent frames cannot make health flicker during cadence-detector warm-up.
+// Two consecutive mismatches are strong collision evidence and activate the
+// fault; a lone mismatch (bus glitch, boundary sample) only arms a pending
+// strike that the next clean check clears. Once active, require a run of
+// clean independent checks before clearing so alternating mixed and coherent
+// frames cannot make health flicker during cadence-detector warm-up.
 class CoherenceDetector {
 public:
     void feed(bool coherent)
     {
         if (!coherent) {
-            _score = 20;
-        } else if (_score > 0) {
-            _score--;
+            if (_pending) {
+                _score = 20;
+            }
+            _pending = true;
+        } else {
+            _pending = false;
+            if (_score > 0) {
+                _score--;
+            }
         }
     }
     bool active() const { return _score > 0; }
 
 private:
     uint8_t _score = 0;
+    bool _pending = false;
 };
 
 }  // namespace ZhiannBMS

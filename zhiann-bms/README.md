@@ -27,3 +27,11 @@ no automatic in-flight action to the `Unhealthy` state itself.
 
 The reviewed firmware fits CubeOrangePlus with only **304 bytes free**. Do not
 modify or rebuild it without rechecking flash use and artifact provenance.
+
+## Building firmware for this integration
+
+Configure with the extra hwdef to disable Lua scripting (unused on this
+platform; frees ~180 KB flash — without it the image no longer fits):
+
+    ./waf configure --board CubeOrangePlus --extra-hwdef=zhiann-bms/extra-hwdef.dat
+    ./waf copter

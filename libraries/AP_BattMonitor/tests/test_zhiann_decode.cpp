@@ -55,11 +55,21 @@ TEST(ZhiannDecode, classify_alarm)
     EXPECT_TRUE(classify(0x1824F080, c));
     EXPECT_TRUE(classify(0x1824F0EF, c));
 
-    // Reject lookalike PF 0x24 traffic with the wrong priority,
-    // destination class, or source-address class.
-    EXPECT_FALSE(classify(0x1024F002, c));
+    // Any priority and the null/global destinations are accepted: alarm
+    // delivery must not hinge on unverified priority or exact-destination
+    // assumptions.
+    EXPECT_TRUE(classify(0x1024F002, c));
+    EXPECT_EQ(c.type, FRAME_ALARM);
+    EXPECT_TRUE(classify(0x0024F002, c));   // priority 0
+    EXPECT_TRUE(classify(0x18240002, c));   // PS 0x00 (null destination)
+    EXPECT_TRUE(classify(0x1824FF02, c));   // PS 0xFF (global destination)
+
+    // Reject lookalike traffic: mid-range destination, source address
+    // above 0xEF, or a data-page/reserved bit set (a different PGN).
     EXPECT_FALSE(classify(0x18240102, c));
     EXPECT_FALSE(classify(0x1824F0F0, c));
+    EXPECT_FALSE(classify(0x1924F002, c));  // DP = 1
+    EXPECT_FALSE(classify(0x1A24F002, c));  // reserved bit = 1
 }
 
 TEST(ZhiannDecode, canonical_dlc)
@@ -67,7 +77,10 @@ TEST(ZhiannDecode, canonical_dlc)
     EXPECT_TRUE(valid_dlc(FRAME_PACK_VOLT, 8));
     EXPECT_TRUE(valid_dlc(FRAME_TEMP_SOC, 8));
     EXPECT_TRUE(valid_dlc(FRAME_CELL_23_24, 4));
+    // both alarm words fit in bytes 0-3, so short alarm frames still count
     EXPECT_TRUE(valid_dlc(FRAME_ALARM, 8));
+    EXPECT_TRUE(valid_dlc(FRAME_ALARM, 4));
+    EXPECT_FALSE(valid_dlc(FRAME_ALARM, 3));
     EXPECT_FALSE(valid_dlc(FRAME_PACK_VOLT, 4));
     EXPECT_FALSE(valid_dlc(FRAME_CELL_23_24, 8));
     EXPECT_FALSE(valid_dlc(0x77, 8));
@@ -225,14 +238,30 @@ TEST(ZhiannDecode, consumed_capacity_from_soc)
     EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 1000), 0.0f, 0.01f);
     EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 440), 24640.0f, 0.01f);
     EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 0), 44000.0f, 0.01f);
-    // Initial SOC seeds capacity; later SOC may raise but never erase the
+    // SOC-derived consumption may raise but never erase the
     // calibrated-current integral.
-    EXPECT_NEAR(reconciled_consumed_mah(0, 44000.0f, 440, false),
+    EXPECT_NEAR(reconciled_consumed_mah(0, 44000.0f, 440),
                 24640.0f, 0.01f);
-    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 500, true),
+    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 500),
                 25000.0f, 0.01f);
-    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 400, true),
+    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 400),
                 26400.0f, 0.01f);
+}
+
+TEST(ZhiannDecode, consumed_floor_survives_session_reseed)
+{
+    // boot: seeded from SOC 44.0% on a 44Ah pack
+    float consumed = reconciled_consumed_mah(0.0f, 44000.0f, 440);
+    EXPECT_NEAR(consumed, 24640.0f, 0.01f);
+    // current integration continues past the SOC-derived floor
+    consumed += 1500.0f;
+    // a BMS outage resets the session; the first SOC afterwards reads
+    // higher (noise/recovery) - re-seeding must never move consumption down
+    EXPECT_NEAR(reconciled_consumed_mah(consumed, 44000.0f, 450),
+                consumed, 0.01f);
+    // while a genuinely lower SOC still raises the floor
+    EXPECT_NEAR(reconciled_consumed_mah(consumed, 44000.0f, 300),
+                30800.0f, 0.01f);
 }
 
 TEST(ZhiannDecode, invalid_soc_is_rejected)
@@ -327,13 +356,86 @@ TEST(ZhiannDecode, coherence_detector_holds_until_clean_run)
     CoherenceDetector detector;
     EXPECT_FALSE(detector.active());
     detector.feed(false);
-    EXPECT_TRUE(detector.active());
+    EXPECT_FALSE(detector.active());    // a single hit only arms a strike
+    detector.feed(false);
+    EXPECT_TRUE(detector.active());     // second consecutive hit activates
     for (uint8_t i = 0; i < 19; i++) {
         detector.feed(true);
         EXPECT_TRUE(detector.active());
     }
     detector.feed(true);
     EXPECT_FALSE(detector.active());
+}
+
+TEST(ZhiannDecode, coherence_requires_consecutive_mismatches)
+{
+    CoherenceDetector detector;
+    // isolated mismatches separated by clean checks never activate: a
+    // boundary sample or bus glitch is not collision evidence on its own
+    for (uint8_t i = 0; i < 6; i++) {
+        detector.feed(false);
+        EXPECT_FALSE(detector.active());
+        detector.feed(true);
+        EXPECT_FALSE(detector.active());
+    }
+    // two consecutive mismatches activate the fault
+    detector.feed(false);
+    detector.feed(false);
+    EXPECT_TRUE(detector.active());
+}
+
+TEST(ZhiannDecode, dup_detector_tolerates_single_lost_frame)
+{
+    DupDetector det;
+    uint32_t t = 1000;
+    det.feed(t);
+    // four clean ~500ms intervals: one short of qualification
+    for (int i = 0; i < 4; i++) {
+        t += 500; det.feed(t);
+    }
+    EXPECT_FALSE(det.qualified());
+    // a single lost frame (~1s gap) is neutral: no reset, no credit
+    t += 1000; det.feed(t);
+    EXPECT_FALSE(det.qualified());
+    // the fifth clean interval completes qualification
+    t += 500; det.feed(t);
+    EXPECT_TRUE(det.qualified());
+    EXPECT_FALSE(det.active());
+
+    // a gap beyond the single-lost-frame window resets qualification
+    t += 1300; det.feed(t);
+    EXPECT_FALSE(det.qualified());
+}
+
+TEST(ZhiannDecode, pack_volt_partial_validation)
+{
+    // synthetic: plausible voltage (102.72V) with a corrupt/sentinel
+    // current register (INT32_MIN). Voltage and current are judged
+    // independently, so the frame keeps liveness while current is dropped.
+    uint8_t d[8]; hex2bytes("1611202800000080", d);
+    EXPECT_NEAR(pack_voltage(d), 102.72f, 0.001f);
+    EXPECT_TRUE(pack_voltage_valid(pack_voltage(d)));
+    EXPECT_FALSE(current_valid(current_amps(d)));
+
+    // an implausible voltage rejects the frame regardless of the current
+    uint8_t bad_v[8]; hex2bytes("16110000E8030000", bad_v);
+    EXPECT_FALSE(pack_voltage_valid(pack_voltage(bad_v)));
+    EXPECT_TRUE(current_valid(current_amps(bad_v)));
+}
+
+TEST(ZhiannDecode, temp_single_sensor_selection)
+{
+    float out = 0;
+    // both plausible: the hotter one is published
+    EXPECT_TRUE(select_temperature(26.0f, 28.0f, out));
+    EXPECT_NEAR(out, 28.0f, 0.001f);
+    // one failed sensor (s16 limit ~3276.7C) must not blank temperature
+    EXPECT_TRUE(select_temperature(3276.7f, 28.0f, out));
+    EXPECT_NEAR(out, 28.0f, 0.001f);
+    EXPECT_TRUE(select_temperature(26.0f, -3276.8f, out));
+    EXPECT_NEAR(out, 26.0f, 0.001f);
+    // both failed: no update at all
+    EXPECT_FALSE(select_temperature(3276.7f, -3276.8f, out));
 }
 
 AP_GTEST_MAIN()
