@@ -36,8 +36,12 @@ provided parameter files intentionally do not invent airframe-specific safety
 limits. A lost/unhealthy monitor blocks arming, but this ArduPilot base assigns
 no automatic in-flight action to the `Unhealthy` state itself.
 
-The reviewed firmware fits CubeOrangePlus with only **304 bytes free**. Do not
-modify or rebuild it without rechecking flash use and artifact provenance.
+The reviewed 4.7.0 firmware fits CubeOrangePlus with 247,028 bytes free
+(the 4.6.3 build was nearly full; 4.7 upstream is substantially smaller on
+this board). The ExternalAHRS trims in the extra-hwdef are kept for parity
+with the operator's SBG configuration. Do not modify or rebuild the
+artifact without rechecking flash use and provenance in
+`FIRMWARE-MANIFEST.md`.
 
 ## Building firmware for this integration
 
