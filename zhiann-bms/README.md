@@ -1,8 +1,19 @@
 # Zhiann BMS integration assets
 
-Reviewed ArduCopter 4.6.3 build for CubeOrangePlus with the
-AP_BattMonitor_ZhiannBMS driver (BATT_MONITOR=30, CAN_Dx_PROTOCOL=15,
+Reviewed ArduCopter 4.7.0 build for CubeOrangePlus with the
+AP_BattMonitor_ZhiannBMS driver (BATT_MONITOR=33, CAN_Dx_PROTOCOL=15,
 pack select via BATTn_SERIAL_NUM or -1 auto-bind).
+
+## MIGRATION from the 4.6.3 branch — BATT_MONITOR value changed
+
+On `Copter-4.6.3-zhiann-bms` the driver was `BATT_MONITOR=30`. Upstream
+4.7 assigned 30/31/32 to new backends (INA3221, Analog Current Only,
+TIBQ76952), so on this branch the driver is **`BATT_MONITOR=33`**.
+Operators upgrading from the 4.6.3 firmware MUST set every
+`BATTn_MONITOR` that was 30 to 33 (see the updated `params-*.param`
+templates) and reboot; a value of 30 on 4.7 selects the INA3221 I2C
+backend, not the Zhiann driver. `CAN_Dx_PROTOCOL=15` and
+`BATTn_SERIAL_NUM` semantics are unchanged.
 
 - `arducopter-CubeOrangePlus.apj` — flash with
   `Tools/scripts/uploader.py zhiann-bms/arducopter-CubeOrangePlus.apj`

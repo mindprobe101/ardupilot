@@ -2,11 +2,18 @@
 
 24S smart battery packs (Shenzhen Zhian New Energy, ZB3CN7 series,
 ~100 V, 44 Ah, up to 5 packs on one CAN bus) integrated with a
-CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
+CubeOrange+ running ArduCopter 4.7.0, on branch `Copter-4.7.0-zhiann-bms`
+(ported from `Copter-4.6.3-zhiann-bms`).
+
+**MIGRATION note:** on the 4.6.3 branch the driver was `BATT_MONITOR=30`;
+upstream 4.7 took values 30-32 for new backends, so here it is
+`BATT_MONITOR=33`. Operators coming from the 4.6.3 firmware must update
+every `BATTn_MONITOR` from 30 to 33 (30 now selects INA3221).
+`CAN_Dx_PROTOCOL=15` is unchanged.
 
 ## What exists now
 
-- **`AP_BattMonitor_ZhiannBMS`** (`BATT_MONITOR=30`,
+- **`AP_BattMonitor_ZhiannBMS`** (`BATT_MONITOR=33`,
   `CAN_Dx_PROTOCOL=15`): a receive-only CAN battery backend providing
   voltage, calibrated current with conservative BMS-SOC/current reconciled
   consumed mAh/Wh, all 24 cell voltages

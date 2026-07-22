@@ -116,7 +116,7 @@ this file is the operational knowledge.
 | `zhiann-bms/` (in ardupilot repo) | reviewed firmware, manifest + mapping templates |
 | `libraries/AP_BattMonitor/tests/test_zhiann_decode.cpp` | replay/boundary regression tests (21 cases) |
 
-## 6. ArduPilot driver capabilities (branch Copter-4.6.3-zhiann-bms)
+## 6. ArduPilot driver capabilities (branch Copter-4.7.0-zhiann-bms)
 
 Voltage, current, consumed mAh/Wh initialized from BMS SOC and then kept at
 the conservative maximum of the SOC-derived floor and current integration,

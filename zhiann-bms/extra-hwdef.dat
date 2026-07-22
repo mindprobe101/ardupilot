@@ -1,7 +1,11 @@
 # flash recovery: disable ExternalAHRS backends of brands not used on
-# this platform (SBG is the only external AHRS in use; scripting stays
-# enabled per operator requirement)
+# this platform (SBG is the only external AHRS in use and stays enabled;
+# 4.7 ships an SBG backend upstream. Scripting stays enabled per operator
+# requirement)
 define AP_EXTERNAL_AHRS_VECTORNAV_ENABLED 0
 define AP_EXTERNAL_AHRS_MICROSTRAIN5_ENABLED 0
 define AP_EXTERNAL_AHRS_MICROSTRAIN7_ENABLED 0
 define AP_EXTERNAL_AHRS_INERTIALLABS_ENABLED 0
+# new ExternalAHRS backends added in 4.7, also unused on this platform
+define AP_EXTERNAL_AHRS_GSOF_ENABLED 0
+define AP_EXTERNAL_AHRS_SENSAITION_ENABLED 0

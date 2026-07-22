@@ -37,7 +37,7 @@
     22-24:  AP_BattMonitor_INA3221.cpp
     25-26:  AP_BattMonitor_INA2xx.cpp
     27-28:  AP_BattMonitor_INA2xx.cpp, AP_BattMonitor_INA239.cpp (legacy duplication)
-    30:     AP_BattMonitor_DroneCAN.cpp
+    30:     AP_BattMonitor_DroneCAN.cpp, AP_BattMonitor_ZhiannBMS.cpp (same CURR_MULT parameter)
     36:     AP_BattMonitor_ESC.cpp
     40-43:  AP_BattMonitor_FuelLevel_Analog.cpp
     45-48:  AP_BattMonitor_FuelLevel_Analog.cpp

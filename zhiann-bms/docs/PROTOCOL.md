@@ -208,6 +208,8 @@ standby pack cannot pass arming. Basis for improvement #1 (standby GCS msg).
 ## Consumers
 
 - ArduPilot driver: `AP_BattMonitor_ZhiannBMS` on branch
-  `Copter-4.6.3-zhiann-bms` of the fork (BATT_MONITOR=30,
-  CAN_Dx_PROTOCOL=15), nodes 0-15 via BATTn_SERIAL_NUM or -1 auto-bind.
+  `Copter-4.7.0-zhiann-bms` of the fork (BATT_MONITOR=33 on 4.7;
+  the older `Copter-4.6.3-zhiann-bms` branch used BATT_MONITOR=30;
+  CAN_Dx_PROTOCOL=15 on both), nodes 0-15 via BATTn_SERIAL_NUM or -1
+  auto-bind.
 - Host decoder: `can_bms/can_sniffer/scripts/decode.py`.
