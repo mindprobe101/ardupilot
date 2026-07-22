@@ -330,9 +330,11 @@ public:
                 if (_clean_intervals < 5) {
                     _clean_intervals++;
                 }
-            } else if (dt > 750 && dt <= 1250) {
-                // a single lost ~500ms frame: neither collision evidence
-                // nor a clean interval, so hold qualification progress
+            } else if (dt > 750 && dt <= 1800) {
+                // up to ~3 lost ~500ms frames: neither collision evidence
+                // nor a clean interval, so hold qualification progress.
+                // Long gaps are never a collision signature; resetting on
+                // them only makes qualification flap during dropouts
             } else {
                 _clean_intervals = 0;
             }
@@ -362,32 +364,48 @@ private:
     bool _active = false;
 };
 
-// Two consecutive mismatches are strong collision evidence and activate the
-// fault; a lone mismatch (bus glitch, boundary sample) only arms a pending
-// strike that the next clean check clears. Once active, require a run of
+// Two consecutive mismatches from the same evidence stream (SOC voltage
+// mirror or cell-sum) are strong collision evidence and activate the fault;
+// a lone mismatch (bus glitch, boundary sample) only arms that stream's
+// pending strike, which the stream's next clean check clears. The streams
+// keep separate strikes: one physical transient hitting both checks once
+// each within a burst must not activate. Once active, require a run of
 // clean independent checks before clearing so alternating mixed and coherent
 // frames cannot make health flicker during cadence-detector warm-up.
 class CoherenceDetector {
 public:
-    void feed(bool coherent)
+    void feed_vmir(bool coherent) { feed(_pending_vmir, coherent); }
+    void feed_cellsum(bool coherent) { feed(_pending_cellsum, coherent); }
+    bool active() const { return _score > 0; }
+
+    // session boundary (>5s outage): a half-armed strike must not pair
+    // with the new session's first mismatch, while an accumulated active
+    // score is deliberately preserved as evidence
+    void clear_pending()
+    {
+        _pending_vmir = false;
+        _pending_cellsum = false;
+    }
+
+private:
+    void feed(bool &pending, bool coherent)
     {
         if (!coherent) {
-            if (_pending) {
+            if (pending) {
                 _score = 20;
             }
-            _pending = true;
+            pending = true;
         } else {
-            _pending = false;
+            pending = false;
             if (_score > 0) {
                 _score--;
             }
         }
     }
-    bool active() const { return _score > 0; }
 
-private:
     uint8_t _score = 0;
-    bool _pending = false;
+    bool _pending_vmir = false;
+    bool _pending_cellsum = false;
 };
 
 }  // namespace ZhiannBMS

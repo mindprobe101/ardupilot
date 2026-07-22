@@ -355,15 +355,15 @@ TEST(ZhiannDecode, coherence_detector_holds_until_clean_run)
 {
     CoherenceDetector detector;
     EXPECT_FALSE(detector.active());
-    detector.feed(false);
+    detector.feed_vmir(false);
     EXPECT_FALSE(detector.active());    // a single hit only arms a strike
-    detector.feed(false);
+    detector.feed_vmir(false);
     EXPECT_TRUE(detector.active());     // second consecutive hit activates
     for (uint8_t i = 0; i < 19; i++) {
-        detector.feed(true);
+        detector.feed_vmir(true);
         EXPECT_TRUE(detector.active());
     }
-    detector.feed(true);
+    detector.feed_vmir(true);
     EXPECT_FALSE(detector.active());
 }
 
@@ -373,18 +373,70 @@ TEST(ZhiannDecode, coherence_requires_consecutive_mismatches)
     // isolated mismatches separated by clean checks never activate: a
     // boundary sample or bus glitch is not collision evidence on its own
     for (uint8_t i = 0; i < 6; i++) {
-        detector.feed(false);
+        detector.feed_cellsum(false);
         EXPECT_FALSE(detector.active());
-        detector.feed(true);
+        detector.feed_cellsum(true);
         EXPECT_FALSE(detector.active());
     }
-    // two consecutive mismatches activate the fault
-    detector.feed(false);
-    detector.feed(false);
+    // two consecutive mismatches of the same kind activate the fault
+    detector.feed_cellsum(false);
+    detector.feed_cellsum(false);
     EXPECT_TRUE(detector.active());
 }
 
-TEST(ZhiannDecode, dup_detector_tolerates_single_lost_frame)
+TEST(ZhiannDecode, coherence_streams_have_separate_strikes)
+{
+    CoherenceDetector detector;
+    // one physical transient (a load step straddling a burst) can hit the
+    // voltage-mirror and cell-sum checks once each within 500ms; a single
+    // strike per stream is not two of a kind and must not activate
+    detector.feed_vmir(false);
+    detector.feed_cellsum(false);
+    EXPECT_FALSE(detector.active());
+    detector.feed_vmir(true);
+    detector.feed_cellsum(true);
+    EXPECT_FALSE(detector.active());
+    // while two consecutive mismatches on one stream activate, even with
+    // the other stream's clean evidence interleaved
+    detector.feed_vmir(false);
+    detector.feed_cellsum(true);
+    detector.feed_vmir(false);
+    EXPECT_TRUE(detector.active());
+}
+
+TEST(ZhiannDecode, coherence_session_boundary_clears_strikes_not_score)
+{
+    CoherenceDetector detector;
+    // a >5s outage invalidates a half-armed strike: the first mismatch of
+    // the new session must not pair with pre-outage evidence
+    detector.feed_vmir(false);
+    detector.clear_pending();
+    detector.feed_vmir(false);
+    EXPECT_FALSE(detector.active());
+    // but an accumulated active score is preserved across the boundary
+    detector.feed_vmir(false);
+    EXPECT_TRUE(detector.active());
+    detector.clear_pending();
+    EXPECT_TRUE(detector.active());
+}
+
+TEST(ZhiannDecode, coherent_window_tolerates_single_bad_generation)
+{
+    // Driver semantics: cell publication and health key off the last
+    // COHERENT complete snapshot staying fresh within the 5s battery
+    // timeout. An incoherent generation never advances the timestamp (its
+    // cells are dropped, it only feeds the detector), yet one bad 500ms
+    // generation leaves the window fresh; only sustained incoherence or
+    // silence stales it.
+    const uint32_t last_coherent_ms = 10000;
+    // the next (incoherent) generation does not stale the window
+    EXPECT_TRUE(fresh_ms(10500, last_coherent_ms, 5000));
+    // sustained incoherence fails once the 5s window is exceeded
+    EXPECT_TRUE(fresh_ms(15000, last_coherent_ms, 5000));
+    EXPECT_FALSE(fresh_ms(15001, last_coherent_ms, 5000));
+}
+
+TEST(ZhiannDecode, dup_detector_tolerates_lost_frames)
 {
     DupDetector det;
     uint32_t t = 1000;
@@ -397,13 +449,20 @@ TEST(ZhiannDecode, dup_detector_tolerates_single_lost_frame)
     // a single lost frame (~1s gap) is neutral: no reset, no credit
     t += 1000; det.feed(t);
     EXPECT_FALSE(det.qualified());
+    // so are up to ~3 lost frames: long gaps are never a collision
+    // signature, so they must not restart qualification
+    t += 1500; det.feed(t);
+    EXPECT_FALSE(det.qualified());
     // the fifth clean interval completes qualification
     t += 500; det.feed(t);
     EXPECT_TRUE(det.qualified());
     EXPECT_FALSE(det.active());
 
-    // a gap beyond the single-lost-frame window resets qualification
-    t += 1300; det.feed(t);
+    // a 1500ms gap after qualification is equally neutral
+    t += 1500; det.feed(t);
+    EXPECT_TRUE(det.qualified());
+    // a gap beyond the neutral window (>1800ms) resets qualification
+    t += 1900; det.feed(t);
     EXPECT_FALSE(det.qualified());
 }
 
