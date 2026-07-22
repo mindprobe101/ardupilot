@@ -101,8 +101,10 @@ private:
                                     // (the state array caps at 12/14)
     ZhiannBMS::CellAccumulator _cell_accumulator;
     float _cell_accumulator_voltage = 0;
-    uint32_t _cell_snapshot_ms = 0;
-    bool _cell_snapshot_coherent = false;
+    uint64_t _cell_voltage_sample_us = 0;   // PACK_VOLT arrival time of the
+                                            // voltage snapshotted for the
+                                            // cell-sum coherence check
+    uint32_t _last_coherent_snapshot_ms = 0;
     ZhiannBMS::CoherenceDetector _coherence_detector;
     uint16_t _soc_frame_vmir = 0;   // voltage mirror from the SOC frame
     float _temp1_c = 0;

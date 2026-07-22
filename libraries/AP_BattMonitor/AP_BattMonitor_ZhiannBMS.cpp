@@ -411,7 +411,7 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         // older one may straddle a load step and fake a mismatch
         if (_last_frame_us != 0 &&
             (AP_HAL::micros64() - _last_frame_us) <= 500000ULL) {
-            _coherence_detector.feed(ZhiannBMS::pack_vmir_coherent(
+            _coherence_detector.feed_vmir(ZhiannBMS::pack_vmir_coherent(
                 _interim_state.voltage, _soc_frame_vmir,
                 ZHIANN_CELL_SUM_TOLERANCE_V));
         }
@@ -463,9 +463,11 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
     default:
         if (frame_type == ZhiannBMS::FRAME_CELL_1_2) {
             // PACK_VOLT begins the same canonical burst. Preserve that
-            // generation's voltage so readers never compare committed cells
-            // with a later generation's voltage during a load step.
+            // generation's voltage, plus its arrival time for the freshness
+            // gate below, so readers never compare committed cells with a
+            // later generation's voltage during a load step.
             _cell_accumulator_voltage = _interim_state.voltage;
+            _cell_voltage_sample_us = _last_frame_us;
         }
         if (frame_type == ZhiannBMS::FRAME_CELL_1_2) {
             // the cell-count word rides in this frame; a pack reporting a
@@ -486,18 +488,31 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         if (_cell_accumulator.feed(frame_type, frame.data, AP_HAL::millis(),
                                    ZHIANN_CELL_SNAPSHOT_SPAN_MS)) {
             const uint16_t *cells = _cell_accumulator.cells();
-            _cell_snapshot_coherent = ZhiannBMS::pack_cells_coherent(
-                _cell_accumulator_voltage, cells, 24,
-                ZHIANN_CELL_SUM_TOLERANCE_V);
-            _coherence_detector.feed(_cell_snapshot_coherent);
-            for (uint8_t i = 0; i < ARRAY_SIZE(_cells24); i++) {
-                _cells24[i] = cells[i];
-                if (i < ARRAY_SIZE(_interim_state.cell_voltages.cells)) {
-                    _interim_state.cell_voltages.cells[i] = cells[i];
-                }
+            // compare only against a recent (<=500ms) voltage sample from
+            // this burst: an older one may straddle a load step and fake a
+            // mismatch (same freshness gate as the SOC voltage mirror)
+            bool coherent = false;
+            if (_cell_voltage_sample_us != 0 &&
+                (AP_HAL::micros64() - _cell_voltage_sample_us) <= 500000ULL) {
+                coherent = ZhiannBMS::pack_cells_coherent(
+                    _cell_accumulator_voltage, cells, 24,
+                    ZHIANN_CELL_SUM_TOLERANCE_V);
+                _coherence_detector.feed_cellsum(coherent);
             }
-            _cell_count = uint8_t(_cell_accumulator.cell_count());
-            _cell_snapshot_ms = AP_HAL::millis();
+            // an incoherent generation is detector evidence only: it must
+            // never reach the published cell state. Publication stays on
+            // the previous coherent snapshot until that ages past the 5s
+            // freshness window in read()
+            if (coherent) {
+                for (uint8_t i = 0; i < ARRAY_SIZE(_cells24); i++) {
+                    _cells24[i] = cells[i];
+                    if (i < ARRAY_SIZE(_interim_state.cell_voltages.cells)) {
+                        _interim_state.cell_voltages.cells[i] = cells[i];
+                    }
+                }
+                _cell_count = uint8_t(_cell_accumulator.cell_count());
+                _last_coherent_snapshot_ms = AP_HAL::millis();
+            }
             _cell_accumulator.reset();
         }
         break;
@@ -655,10 +670,11 @@ void AP_BattMonitor_ZhiannBMS::read()
         _fine_soc_ms = 0;
         _interim_state.temperature_time = 0;
         _interim_state.last_time_micros = 0;
-        // _current_seen and _has_current both deliberately stay true once
-        // current has ever been seen, so capacity failsafes remain armed
-        // across a BMS outage; consumption re-seeding is floored by
-        // reconcile_consumption() when the pack returns
+        // _current_seen and _has_current are deliberately preserved at
+        // their last values, so when current was good at outage onset the
+        // capacity failsafes remain armed across a BMS outage; consumption
+        // re-seeding is floored by reconcile_consumption() when the pack
+        // returns
         memset(_interim_state.cell_voltages.cells, 0xFF,
                sizeof(_interim_state.cell_voltages.cells));
         memset(_state.cell_voltages.cells, 0xFF,
@@ -666,9 +682,13 @@ void AP_BattMonitor_ZhiannBMS::read()
         memset(_cells24, 0xFF, sizeof(_cells24));
         _cell_accumulator.reset();
         _cell_accumulator_voltage = 0;
-        _cell_snapshot_ms = 0;
-        _cell_snapshot_coherent = false;
+        _cell_voltage_sample_us = 0;
+        _last_coherent_snapshot_ms = 0;
         _cell_count = 0;
+        // session boundary: a half-armed coherence strike from before the
+        // outage must not pair with the new session's first mismatch (an
+        // accumulated active score is deliberately preserved as evidence)
+        _coherence_detector.clear_pending();
 
         // SOC frames still arriving means the pack is present but in
         // standby (its detail frames stop): tell the operator, since the
@@ -689,7 +709,11 @@ void AP_BattMonitor_ZhiannBMS::read()
 
     _state.healthy = true;
     _state.voltage = _interim_state.voltage;
-    _state.current_amps = _interim_state.current_amps;
+    // While the current register is faulted, publish 0A (the no-reading
+    // convention) rather than the stale last-good reading. Note: with a
+    // persistent current fault the mAh capacity failsafes are inactive
+    // (has_current false) and the voltage failsafes are the backstop.
+    _state.current_amps = _current_fault ? 0 : _interim_state.current_amps;
     _state.consumed_mah = _interim_state.consumed_mah;
     _state.consumed_wh = _interim_state.consumed_wh;
     _state.last_time_micros = _interim_state.last_time_micros;
@@ -709,8 +733,13 @@ void AP_BattMonitor_ZhiannBMS::read()
         _state.healthy = false;
     }
 
+    // Publication and health key off the last COHERENT complete snapshot
+    // staying inside the standard 5s freshness window: one incoherent
+    // 500ms generation (e.g. a throttle punch straddling a burst) must not
+    // blip health, while sustained incoherence still fails via both this
+    // window and the coherence detector.
     const bool cell_snapshot_valid = _cell_count == 24 &&
-        ZhiannBMS::fresh_ms(now_ms, _cell_snapshot_ms,
+        ZhiannBMS::fresh_ms(now_ms, _last_coherent_snapshot_ms,
                             AP_BATT_MONITOR_TIMEOUT);
     if (cell_snapshot_valid) {
         for (uint8_t i = 0; i < ARRAY_SIZE(_state.cell_voltages.cells); i++) {
@@ -724,10 +753,9 @@ void AP_BattMonitor_ZhiannBMS::read()
                sizeof(_state.cell_voltages.cells));
         memset(_cells24, 0xFF, sizeof(_cells24));
         _cell_count = 0;
-        _cell_snapshot_coherent = false;
     }
     _coherence_fault = _coherence_detector.active();
-    _has_cell_voltages = cell_snapshot_valid && _cell_snapshot_coherent;
+    _has_cell_voltages = cell_snapshot_valid;
     if (_coherence_fault) {
         _state.healthy = false;
         if (_coherence_warn_ms == 0 || now_ms - _coherence_warn_ms >= 30000) {
