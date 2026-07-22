@@ -1,4 +1,6 @@
 # Zhiann BMS fleet: 4-pack logistics profile (auto-bind)
+# Mapping template only: set per-instance ARM/LOW/CRT voltage or mAh
+# thresholds and LOW/CRT actions for the airframe before flight.
 CAN_P2_DRIVER,2
 CAN_D2_PROTOCOL,15
 BATT_MONITOR,30

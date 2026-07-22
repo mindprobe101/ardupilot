@@ -8,18 +8,22 @@ CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
 
 - **`AP_BattMonitor_ZhiannBMS`** (`BATT_MONITOR=30`,
   `CAN_Dx_PROTOCOL=15`): a receive-only CAN battery backend providing
-  voltage, calibrated current with consumed mAh/Wh, all 24 cell voltages
-  (14 live via MAVLink, 24 in dataflash), dual temperatures, BMS SOC with
-  coulomb-count fallback, alarm-frame fault mapping, and operator
-  diagnostics: duplicate-node detection, standby detection, unmapped-node
-  warning, per-node fleet inventory. Multi-pack via `BATTn_SERIAL_NUM`
+  voltage, calibrated current with conservative BMS-SOC/current reconciled
+  consumed mAh/Wh, all 24 cell voltages
+  (14 live via MAVLink, 24 in dataflash), dual temperatures, healthy-state
+  BMS SOC, alarm-frame fault mapping, and operator
+  diagnostics: qualified-session duplicate-node detection, atomic cell
+  snapshots, cell-sum/SOC-mirror coherence, standby detection,
+  fail-safe unmapped-node handling, per-node fleet inventory. Multi-pack via `BATTn_SERIAL_NUM`
   (node number, or -1 auto-bind); nodes 0-15, up to 9 instances.
 - **Pure decode core** (`AP_BattMonitor_ZhiannBMS_decode.h`) shared with
-  a gtest replay suite (`tests/test_zhiann_decode.cpp`, 11 cases built
-  from real captured frames) - `./waf configure --board sitl` then build
+  a gtest replay suite (`tests/test_zhiann_decode.cpp`, 21 cases combining
+  real captured frames with explicit synthetic boundary cases) -
+  `./waf configure --board sitl` then build
   target `tests/test_zhiann_decode`.
-- **Ops assets** (this folder): prebuilt firmware, 2-pack/4-pack param
-  presets, PROTOCOL.md / LOGGING.md / LEARNINGS.md.
+- **Ops assets** (this folder): hash-attested firmware and build manifest,
+  2-pack/4-pack mapping templates, PROTOCOL.md / LOGGING.md / LEARNINGS.md,
+  and a software-versus-bench VALIDATION.md report.
 - **Bench tooling** (developer machine, `~/can_bms`): NUCLEO-H753ZI
   sniffer firmware (auto-bitrate RX + command-driven TX), live web
   dashboard with simultaneous logging, capture/decode/fleet-query/
@@ -36,13 +40,14 @@ CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
 3. Vendor spec V1.9 obtained later confirmed units and the polled command
    set; the broadcast profile itself is a customer profile absent from
    the spec (Appendix B stub) - our map remains the reference.
-4. Driver hardened via multi-angle adversarial review (fixed: 32-bit
-   micros wrap resurrection, binding nondeterminism, consumption over
-   outages, frame whitelisting, signed temperatures, SOC staleness) and
-   validated live, including against a real 3-packs-on-one-node
-   collision.
-5. Every capability and hazard was verified on the bench, including
-   deliberately-triggered failure modes.
+4. Driver hardened via multi-angle adversarial review: strict classic-CAN/
+   DLC validation before binding, corrected flagged coarse SOC, bus isolation,
+   atomic complete/fresh telemetry gating, monotonic SOC/current capacity
+   reconciliation, physical plausibility gates, timer/integer-boundary fixes,
+   and three complementary collision defenses.
+5. Nominal telemetry, current calibration, standby, and real multi-pack
+   collisions were bench-verified. Alarm behavior and the newest hardening
+   paths remain explicit bench-validation items rather than assumed facts.
 
 ## Key facts discovered (details in LEARNINGS.md)
 

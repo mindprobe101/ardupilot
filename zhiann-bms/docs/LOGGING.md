@@ -21,8 +21,8 @@ heard. With `LOG_DISARMED=1` they record without arming.
 | Curr | A | pack current, discharge positive (BMS 2 mA/LSB x CURR_MULT) |
 | SOC | % | BMS-reported state of charge |
 | T1, T2 | degC | both temperature sensors (MAVLink/BAT gets only the max) |
-| Alrm | bitmask | raw Alarm word from BMS alarm frame (PF 0x24); 0 if never received |
-| Warn | bitmask | raw Warning word from the same frame |
+| Alm | bitmask | Alarm word from BMS PF 0x24; on multi-pack buses this is the unexpired conservative union of anonymous reports |
+| Warn | bitmask | Warning word from the same frame; likewise unioned and aged on multi-pack buses |
 | Vmir | raw | voltage mirror from the SOC frame; volts = Vmir / 320 |
 | NCel | - | cell count reported by the pack (24 for these packs) |
 | Age | ms | time since the last detail frame (large = standby or lost) |
@@ -30,24 +30,35 @@ heard. With `LOG_DISARMED=1` they record without arming.
 Flag bits: bit0 = healthy, bit1 = standby (SOC frames flowing, detail
 frames stopped), bit2 = duplicate-node collision active, bit3 = SOC came
 from the fine 0.1% frame (else the coarse 1% frame), bit4 = current has
-been seen from this pack.
+been seen in the current pack session, bit5 = an unmapped physical pack is
+live, bit6 = a held coherence fault (PACK differs by more than 1 V from the
+atomic 24-cell sum or from the SOC-frame voltage mirror), bit7 = a severe
+alarm remains latched even if its raw frame has aged out.
 
 Alarm/Warning word bits (vendor spec table 19): B15 discharge
 overcurrent, B14 battery damaged, B13 AFE fault, B12 low temperature,
 B11 high temperature, B10 cell undervoltage, B9 cell overvoltage,
-B8 temperature sensor fault, B0 charge overcurrent. B14|B13 also force
-the instance unhealthy (arming blocked).
+B8 temperature sensor fault, B0 charge overcurrent. Any active Alarm bit
+holds the instance unhealthy; B14|B13 remain latched. Because source-address
+to pack-node mapping is unverified, every alarm is delivered to every
+configured instance. A single-pack explicit clear can clear the latch; on a
+multi-pack bus a severe latch requires FC reboot.
 
 ### ZBC1 / ZBC2 — full cell voltages
 
-ZBC1 carries cells 1-12, ZBC2 cells 13-24, in mV. 65535 means the cell
-has not been received yet. These exist because MAVLink can only carry 14
-cells live; the dataflash has the true 24.
+ZBC1 carries cells 1-12, ZBC2 cells 13-24, in mV. The driver commits these
+atomically only after all seven slices arrive in canonical order within
+250 ms and the full LE cell-count field equals 24. 65535 means no recent
+coherent snapshot. MAVLink can carry only 14 cells; dataflash retains all 24.
 
 ### Standard messages affected by this driver
 
-- `BAT`: Volt/Curr/consumed from the BMS; Temp is the HOTTER of the two
-  sensors; RemPct is the BMS SOC (or coulomb-count fallback).
+- `BAT`: Volt/Curr from the BMS. Consumed mAh/Wh is seeded from the first
+  valid SOC in each connection session, integrated from current thereafter,
+  and raised when a lower BMS SOC implies more use; SOC noise/increases never
+  erase integrated consumption. Temp is the HOTTER sensor; RemPct is fresh
+  BMS SOC while the complete monitor state is healthy. The reconciled
+  consumed-mAh capacity floor continues independently for failsafe checks.
 - `BCL`: cells 1-12 (+13/14 in BCL2) - subset of ZBC1/2.
 - `MSG`: the GCS texts below are also recorded here.
 
@@ -57,13 +68,19 @@ cells live; the dataflash has the true 24.
 |---|---|---|
 | `ZhiannBMS: pack on node N` | fleet inventory: a pack was heard on node N (once per node per boot) | verify the set matches the packs you installed |
 | `ZhiannBMS: duplicate pack on node N` | two or more packs share node N; that instance's data is a mixture and is held unhealthy | do not fly; fix node claims (see LEARNINGS) |
-| `ZhiannBMS: pack on node N not mapped to any battery` | a pack is broadcasting on a node no BATTn_SERIAL_NUM points at (claim migrated, or more packs than configured) | adjust BATTn_SERIAL_NUM / instance count |
+| `ZhiannBMS: pack on node N not mapped to any battery` | a pack is broadcasting on a node no BATTn_SERIAL_NUM points at; all configured instances are held unhealthy while it remains live | do not fly; adjust BATTn_SERIAL_NUM / instance count |
 | `ZhiannBMS: pack on node N in standby` | pack present (SOC frames flowing) but not enabled (detail frames stopped) | press the pack's power button |
+| `ZhiannBMS: incoherent data on node N` | PACK differs by more than 1 V from an atomic 24-cell sum or a recent SOC voltage mirror; the fault is held until a clean run | do not fly; inspect node claims and raw log |
 
 MAVLink BATTERY_STATUS notes: only 14 of 24 cells fit; ArduPilot spreads
 the remaining voltage across the shown cells so their sum equals pack
 voltage (~7.19 V per cell at 100.7 V is NORMAL; relative differences
 remain meaningful). SOC shows -1 while an instance is unhealthy.
+
+Unhealthy data blocks arming. In this ArduPilot base, an in-flight battery
+`Unhealthy` state itself has hardcoded action 0; it reports the failure but
+does not run `BATT_FS_LOW_ACT`/`BATT_FS_CRT_ACT`. Configure and bench-test
+independent voltage/capacity thresholds and actions for every instance.
 
 ## 3. Host-side sniffer logs (Nucleo -> PC)
 

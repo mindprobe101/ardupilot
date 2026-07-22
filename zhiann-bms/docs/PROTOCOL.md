@@ -13,8 +13,8 @@
 > for the broadcast profile. Notable spec facts: BMS stops transmitting
 > after 20 min without a master heartbeat (PF 0x43, dest 0xFF, 2 s) and
 > addresses have a 15 s lease — but our packs broadcast for hours with no
-> heartbeat on the bus, so the drone profile does not enforce this (the
-> hub presumably owns addressing; node = hub port). Polled queries exist
+> heartbeat on the bus, so the drone profile does not enforce this. Later
+> testing proved the node is a pack-firmware claim, not a hub port. Polled queries exist
 > for rated capacity (0.01 Ah), serial, SW version, cell count, chemistry,
 > cycle count, per-cell temps, SOP — untested whether the drone firmware
 > answers them. Spec alarm/warning bit fields (PF 0x24) are documented but
@@ -43,7 +43,7 @@ two independent SOC fields agreed, cell count field matched frame layout).
 | 0x2E0947 | 500 ms | cells 15-18 (mV) |
 | 0x2E094A | 500 ms | cells 23-24 (mV), only 4 bytes |
 | 0x2E0951 | 500 ms | u16 counter/crc, pack voltage (10 mV), **current: s32 LE, 2 mA/LSB, negative = discharge** |
-| 0x401A100 | 200 ms | SOC (%), pack voltage mirror (u16, 1/320 V), u16 slow-rising with load (temperature? 17→19 during test), 0 |
+| 0x401A100 | 200 ms | SOC = byte 0 low 7 bits (%); byte 0 bit 7 + byte 1 are dynamic status; pack voltage mirror (u16, 1/320 V); u16 slow-rising with load (temperature? 17→19); 0 |
 | 0x402A100 | 2 s | u16 zeros, current coarse copy (s16 LE, 0.2 A/LSB), FF FF, const u16 (serial/crc?) |
 
 Frame order within the 500 ms burst: 51, 42, 43, 44, 45, 46, 47, 41, 4A.
@@ -71,9 +71,32 @@ is node 0:
 - `0x402A100` appears only once on the bus (one transmitter, data format
   differed from the single-pack capture - not used by any consumer)
 
-Node numbering appears positional (hub port / chain order): the original
-test pack showed up as node 1 in the 4-pack setup. Bus at 1 Mbit/s carries
-all four packs (~65 frames/s) without collisions or gaps.
+Node numbering initially appeared positional because the original pack moved
+to node 1 in the four-pack setup. Later collision/rejoin testing disproved
+that: nodes are persisted firmware claims that can migrate or collide. Bus at
+1 Mbit/s carried a clean four-pack draw (~65 frames/s) without gaps.
+
+## Broadcast validation findings (2026-07-22 audit)
+
+- All 437,558 recognized frames in the available capture corpus used one
+  canonical payload length: 0x2E09xA is 4 bytes; every other accepted custom
+  frame is 8 bytes. The driver therefore rejects RTR, error, CAN-FD, and
+  wrong-length frames before binding or refreshing state.
+- The coarse SOC is **not** a little-endian u16. Load/standby examples
+  `DEE9...`, `2CFF...`, and `ACFF...` decode as 94%, 44%, and 44% using
+  `byte0 & 0x7F`; treating bytes 0-1 as u16 incorrectly reports 100%.
+- 35,613 complete canonical cell bursts spanned 22-55 ms (p50 24 ms, p99
+  39 ms), with none over 250 ms. The driver assembles them privately and
+  commits only complete, ordered generations with a full u16 cell count of 24.
+- Every full-cell-sum mismatch over 1 V in the reviewed corpus occurred in
+  known node-collision logs. Across 9,871 clean matched SOC/PACK samples the
+  voltage-mirror difference was at most 0.41 V; a collision log had 3,306
+  samples over 1 V (p99 11.54 V, max 11.68 V). Both checks complement cadence
+  detection and require a clean run before the coherence fault clears.
+- Valid vendor alarm IDs use priority 6, PF 0x24, controller destination
+  0xF0-0xFE and BMS source 0x00-0xEF (including random 0x80-0xEF). No alarm
+  was observed on the live fleet, so source-to-broadcast-node mapping and
+  clear semantics remain unverified.
 
 ## Polled command set (verified live 2026-07-21, 4 packs via sniffer TX)
 
@@ -179,11 +202,12 @@ standby pack cannot pass arming. Basis for improvement #1 (standby GCS msg).
 - First u16 of 0x2E0951 (counter/crc), 0x402A100 tail bytes.
 - Scale is within power-brick tolerance of exactly 2 mA/LSB; a clamp-meter
   spot check would pin it further.
-- ArduPilot driver reads node 0 only; multi-instance support (MultiCAN +
-  node select via BATTn_SERIAL_NUM) not yet implemented.
+- Meaning of byte 0 bit 7 and byte 1 in 0x401A10x; they vary under load and
+  wake/standby but are not part of SOC.
 
 ## Consumers
 
 - ArduPilot driver: `AP_BattMonitor_ZhiannBMS` on branch
-  `Copter-4.6.3-zhiann-bms` of the fork (BATT_MONITOR=30, CAN_Dx_PROTOCOL=15).
+  `Copter-4.6.3-zhiann-bms` of the fork (BATT_MONITOR=30,
+  CAN_Dx_PROTOCOL=15), nodes 0-15 via BATTn_SERIAL_NUM or -1 auto-bind.
 - Host decoder: `can_bms/can_sniffer/scripts/decode.py`.
