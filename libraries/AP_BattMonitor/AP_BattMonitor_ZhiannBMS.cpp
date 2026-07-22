@@ -56,6 +56,8 @@
 // header so unit tests can replay captured frames against them
 #include "AP_BattMonitor_ZhiannBMS_decode.h"
 
+extern const AP_HAL::HAL& hal;
+
 // NOTE: do NOT transmit the spec master heartbeat (PF 0x43) to these
 // packs. Field-tested 2026-07-21: a continuous heartbeat whose
 // registered-bitmap omits a momentarily-silent pack makes that pack
@@ -74,8 +76,24 @@
 #define ZHIANN_ALARM_AFE_FAULT         (1U << 13)
 #define ZHIANN_ALARM_BATT_DAMAGED      (1U << 14)
 #define ZHIANN_ALARM_DIS_OVERCURRENT   (1U << 15)
-// alarms that make the battery unsafe to arm on
+// alarms reported to the GCS as MAV_BATTERY_FAULT_CELL_FAIL
 #define ZHIANN_ALARM_SEVERE  (ZHIANN_ALARM_BATT_DAMAGED | ZHIANN_ALARM_AFE_FAULT)
+
+// operator-facing names for the alarm word bits
+static const struct {
+    uint16_t mask;
+    const char *name;
+} zhiann_alarm_names[] = {
+    { ZHIANN_ALARM_CHG_OVERCURRENT, "chg OC" },
+    { ZHIANN_ALARM_TEMP_SENSOR,     "temp sensor" },
+    { ZHIANN_ALARM_CELL_OVERVOLT,   "cell OV" },
+    { ZHIANN_ALARM_CELL_UNDERVOLT,  "cell UV" },
+    { ZHIANN_ALARM_HIGH_TEMP,       "high temp" },
+    { ZHIANN_ALARM_LOW_TEMP,        "low temp" },
+    { ZHIANN_ALARM_AFE_FAULT,       "AFE fault" },
+    { ZHIANN_ALARM_BATT_DAMAGED,    "batt damaged" },
+    { ZHIANN_ALARM_DIS_OVERCURRENT, "dis OC" },
+};
 
 // consider the BMS gone after the codebase-wide battery timeout
 #define ZHIANN_TIMEOUT_US      (AP_BATT_MONITOR_TIMEOUT * 1000ULL)
@@ -133,6 +151,7 @@ AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_instances[AP_BATT_MONITOR_M
 uint8_t AP_BattMonitor_ZhiannBMS::_num_instances;
 uint16_t AP_BattMonitor_ZhiannBMS::_nodes_announced;
 uint32_t AP_BattMonitor_ZhiannBMS::_unmapped_warn_ms[ZhiannBMS::MAX_NODE + 1];
+bool AP_BattMonitor_ZhiannBMS::_misconfig_checked;
 
 AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
         AP_BattMonitor::BattMonitor_State &mon_state,
@@ -290,17 +309,13 @@ void AP_BattMonitor_ZhiannBMS::reconcile_consumption(uint16_t soc_tenths)
     }
     const float previous_mah = _interim_state.consumed_mah;
     const float reconciled_mah = ZhiannBMS::reconciled_consumed_mah(
-        previous_mah, _params._pack_capacity, soc_tenths,
-        _consumption_seeded);
-    if (!_consumption_seeded) {
-        _interim_state.consumed_mah = reconciled_mah;
-        _interim_state.consumed_wh = reconciled_mah *
-            0.001f * _interim_state.voltage;
-        _consumption_seeded = true;
-    } else if (reconciled_mah > previous_mah) {
+        previous_mah, _params._pack_capacity, soc_tenths);
+    if (reconciled_mah > previous_mah) {
         // The BMS has a measured low-current deadband. A falling SOC must
         // therefore be allowed to raise the capacity-failsafe floor, while an
         // SOC increase/noise must never discard current-integrated usage.
+        // This same floor governs (re-)seeding: consumption never moves down,
+        // even on the first SOC after a session reset.
         const float delta_mah = reconciled_mah - previous_mah;
         _interim_state.consumed_mah = reconciled_mah;
         _interim_state.consumed_wh += delta_mah *
@@ -317,22 +332,39 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         {
             const uint64_t now_us = AP_HAL::micros64();
 
+            // voltage anchors liveness: an implausible voltage rejects the
+            // whole frame. Current is judged independently below, so a
+            // current-register fault cannot silence an otherwise live pack.
             const float voltage = ZhiannBMS::pack_voltage(frame.data);
-            const float current = ZhiannBMS::current_amps(frame.data) * _curr_mult;
-            if (!ZhiannBMS::pack_voltage_valid(voltage) ||
-                !ZhiannBMS::current_valid(current)) {
+            if (!ZhiannBMS::pack_voltage_valid(voltage)) {
                 break;
             }
+            const float current = ZhiannBMS::current_amps(frame.data) * _curr_mult;
 
             // duplicate-node detection: two packs interleaved on one node
             // deliver this ~500ms frame at sub-300ms spacing
             _dup.feed(AP_HAL::millis());
             _interim_state.voltage = voltage;
-            _interim_state.current_amps = current;
-            // update_consumed skips the first frame and gaps over 2s
-            update_consumed(_interim_state,
-                            ZhiannBMS::consumption_dt_us(now_us - _last_frame_us));
-            _current_seen = true;
+            if (ZhiannBMS::current_valid(current)) {
+                _interim_state.current_amps = current;
+                // update_consumed skips the first frame and gaps over 2s
+                update_consumed(_interim_state,
+                                ZhiannBMS::consumption_dt_us(now_us - _last_frame_us));
+                _current_seen = true;
+                _current_fault = false;
+            } else {
+                // keep voltage/liveness but hold has_current down and skip
+                // consumption integration until a plausible reading returns
+                _current_fault = true;
+                const uint32_t now_ms = AP_HAL::millis();
+                if (_current_warn_ms == 0 ||
+                    now_ms - _current_warn_ms >= 30000) {
+                    _current_warn_ms = now_ms;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "ZhiannBMS: implausible current from pack on node %d",
+                                  int(bound_node()));
+                }
+            }
             _interim_state.last_time_micros = uint32_t(now_us);
             _last_frame_us = now_us;
         }
@@ -340,16 +372,24 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
 
     case ZhiannBMS::FRAME_TEMP_SOC:
         _last_soc_ms = AP_HAL::millis();
-        // two sensors, signed 0.1C; report the hotter one
+        // two sensors, signed 0.1C; report the hotter plausible one. One
+        // failed sensor must not blank pack temperature entirely
         {
             const float temp1 = ZhiannBMS::temp1_c(frame.data);
             const float temp2 = ZhiannBMS::temp2_c(frame.data);
-            if (ZhiannBMS::temperature_valid(temp1) &&
-                ZhiannBMS::temperature_valid(temp2)) {
-                _temp1_c = temp1;
-                _temp2_c = temp2;
-                _interim_state.temperature = MAX(_temp1_c, _temp2_c);
+            // raw values are logged as-is so a faulty sensor is identifiable
+            _temp1_c = temp1;
+            _temp2_c = temp2;
+            float selected;
+            if (ZhiannBMS::select_temperature(temp1, temp2, selected)) {
+                _interim_state.temperature = selected;
                 _interim_state.temperature_time = _last_soc_ms;
+            } else if (_temp_warn_ms == 0 ||
+                       _last_soc_ms - _temp_warn_ms >= 30000) {
+                _temp_warn_ms = _last_soc_ms;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "ZhiannBMS: temperature sensor fault on node %d",
+                              int(bound_node()));
             }
         }
         if (ZhiannBMS::soc_fine_valid(frame.data)) {
@@ -367,8 +407,10 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         // frames stop: it distinguishes standby from gone-from-bus
         _last_soc_ms = AP_HAL::millis();
         _soc_frame_vmir = ZhiannBMS::soc_voltage_mirror(frame.data);
+        // compare only against a recent (<=500ms) pack-voltage sample: an
+        // older one may straddle a load step and fake a mismatch
         if (_last_frame_us != 0 &&
-            (AP_HAL::micros64() - _last_frame_us) <= 1000000ULL) {
+            (AP_HAL::micros64() - _last_frame_us) <= 500000ULL) {
             _coherence_detector.feed(ZhiannBMS::pack_vmir_coherent(
                 _interim_state.voltage, _soc_frame_vmir,
                 ZHIANN_CELL_SUM_TOLERANCE_V));
@@ -415,14 +457,6 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
                 _warning_ms = now_ms;
             }
         }
-        // Standard alarm frames repeat at 1Hz. Preserve a severe fault if
-        // repetition stops. Multi-pack anonymous alarms remain latched until
-        // FC reboot; a single-pack explicit clear is attributable and safe.
-        if (alarm_bits & ZHIANN_ALARM_SEVERE) {
-            _severe_alarm_latched = true;
-        } else if (_num_instances == 1) {
-            _severe_alarm_latched = false;
-        }
         break;
     }
 
@@ -432,6 +466,22 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
             // generation's voltage so readers never compare committed cells
             // with a later generation's voltage during a load step.
             _cell_accumulator_voltage = _interim_state.voltage;
+        }
+        if (frame_type == ZhiannBMS::FRAME_CELL_1_2) {
+            // the cell-count word rides in this frame; a pack reporting a
+            // different chemistry/series count deserves a loud explanation
+            // for why cell voltages never publish
+            const uint16_t reported = ZhiannBMS::u16(&frame.data[2]);
+            if (reported != 24) {
+                const uint32_t now_ms = AP_HAL::millis();
+                if (_cellcount_warn_ms == 0 ||
+                    now_ms - _cellcount_warn_ms >= 30000) {
+                    _cellcount_warn_ms = now_ms;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                                  "ZhiannBMS: pack on node %d reports %u cells, expected 24",
+                                  int(bound_node()), unsigned(reported));
+                }
+            }
         }
         if (_cell_accumulator.feed(frame_type, frame.data, AP_HAL::millis(),
                                    ZHIANN_CELL_SNAPSHOT_SPAN_MS)) {
@@ -454,8 +504,62 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
     }
 }
 
+// one-time audit of static configuration errors, run from the first read()
+// (all instances exist and have snapshotted their serial parameter by then)
+void AP_BattMonitor_ZhiannBMS::announce_misconfiguration()
+{
+    for (uint8_t i = 0; i < _num_instances; i++) {
+        // parameter-name suffix digit: BATT for instance 0, BATT2.. beyond
+        // (same convention as the front-end's param prefix)
+        char pfx_i[3] {};
+        if (_instances[i]->_state.instance > 0) {
+            hal.util->snprintf(pfx_i, sizeof(pfx_i), "%X",
+                               unsigned(_instances[i]->_state.instance + 1));
+        }
+        const int8_t node = _instances[i]->_configured_node;
+        if (node == -2) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "ZhiannBMS: BATT%s_SERIAL_NUM invalid", pfx_i);
+            continue;
+        }
+        if (node < 0) {
+            continue;
+        }
+        for (uint8_t j = 0; j < i; j++) {
+            if (_instances[j]->_configured_node == node) {
+                char pfx_j[3] {};
+                if (_instances[j]->_state.instance > 0) {
+                    hal.util->snprintf(pfx_j, sizeof(pfx_j), "%X",
+                                       unsigned(_instances[j]->_state.instance + 1));
+                }
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "ZhiannBMS: BATT%s_SERIAL_NUM duplicates BATT%s",
+                              pfx_i, pfx_j);
+                break;
+            }
+        }
+    }
+
+    // CANSensor binds only the first port carrying this protocol
+    uint8_t ports = 0;
+    for (uint8_t i = 0; i < HAL_MAX_CAN_PROTOCOL_DRIVERS; i++) {
+        if (AP::can().get_driver_type(i) == AP_CAN::Protocol::ZhiannBMS) {
+            ports++;
+        }
+    }
+    if (ports > 1) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "ZhiannBMS: protocol on multiple CAN ports; only first is used");
+    }
+}
+
 void AP_BattMonitor_ZhiannBMS::read()
 {
+    if (!_misconfig_checked) {
+        _misconfig_checked = true;
+        announce_misconfiguration();
+    }
+
     WITH_SEMAPHORE(_sem);
 
     // 64-bit micros: no wraparound resurrection after long silence
@@ -473,12 +577,11 @@ void AP_BattMonitor_ZhiannBMS::read()
         _warning_bits = 0;
         _warning_ms = 0;
     }
+    // Alarms are messages only: they feed the MAVLink fault bitmask, the
+    // ZBMS log and a periodic operator warning, and never gate health.
     uint32_t faults = 0;
-    const bool severe_alarm = _severe_alarm_latched;
-    bool alarm_active = false;
     if (ZhiannBMS::fresh_ms(now_ms, _alarm_ms, AP_BATT_MONITOR_TIMEOUT)) {
         const uint16_t a = _alarm_bits;
-        alarm_active = a != 0;
         if (a & (ZHIANN_ALARM_DIS_OVERCURRENT | ZHIANN_ALARM_CHG_OVERCURRENT)) {
             faults |= MAV_BATTERY_FAULT_OVER_CURRENT;
         }
@@ -497,11 +600,37 @@ void AP_BattMonitor_ZhiannBMS::read()
         if (a & (ZHIANN_ALARM_SEVERE | ZHIANN_ALARM_TEMP_SENSOR)) {
             faults |= MAV_BATTERY_FAULT_CELL_FAIL;
         }
-    }
-    if (severe_alarm) {
-        // Preserve the fault reason alongside the deliberately latched
-        // unhealthy state after the standard alarm-frame freshness expires.
-        faults |= MAV_BATTERY_FAULT_CELL_FAIL;
+        // remind the operator every 10s while any alarm bit stays active,
+        // naming the bits. Alarms are anonymous unions delivered to every
+        // instance, so only the first instance speaks for the fleet
+        if (a != 0 && this == _instances[0] &&
+            (_alarm_gcs_ms == 0 || now_ms - _alarm_gcs_ms >= 10000)) {
+            _alarm_gcs_ms = now_ms;
+            char names[40] {};
+            uint8_t used = 0;
+            uint16_t unnamed = a;
+            for (const auto &an : zhiann_alarm_names) {
+                if (!(a & an.mask)) {
+                    continue;
+                }
+                unnamed &= ~an.mask;
+                const int w = hal.util->snprintf(&names[used],
+                                                 sizeof(names) - used, "%s%s",
+                                                 used ? ", " : "", an.name);
+                if (w <= 0 || uint32_t(used) + uint32_t(w) >= sizeof(names)) {
+                    used = sizeof(names) - 1;
+                    break;
+                }
+                used += uint8_t(w);
+            }
+            if (unnamed != 0 && used < sizeof(names) - 1) {
+                hal.util->snprintf(&names[used], sizeof(names) - used,
+                                   "%s0x%X", used ? ", " : "",
+                                   unsigned(unnamed));
+            }
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: BMS alarm: %s",
+                          names);
+        }
     }
     _fault_bitmask = faults;
     _unmapped_active = ZhiannBMS::fresh_ms(now_ms, _unmapped_ms,
@@ -526,8 +655,10 @@ void AP_BattMonitor_ZhiannBMS::read()
         _fine_soc_ms = 0;
         _interim_state.temperature_time = 0;
         _interim_state.last_time_micros = 0;
-        _current_seen = false;
-        _consumption_seeded = false;
+        // _current_seen and _has_current both deliberately stay true once
+        // current has ever been seen, so capacity failsafes remain armed
+        // across a BMS outage; consumption re-seeding is floored by
+        // reconcile_consumption() when the pack returns
         memset(_interim_state.cell_voltages.cells, 0xFF,
                sizeof(_interim_state.cell_voltages.cells));
         memset(_state.cell_voltages.cells, 0xFF,
@@ -556,7 +687,7 @@ void AP_BattMonitor_ZhiannBMS::read()
     }
     _standby = false;
 
-    _state.healthy = !severe_alarm && !alarm_active;
+    _state.healthy = true;
     _state.voltage = _interim_state.voltage;
     _state.current_amps = _interim_state.current_amps;
     _state.consumed_mah = _interim_state.consumed_mah;
@@ -567,7 +698,7 @@ void AP_BattMonitor_ZhiannBMS::read()
     _soc_pct_pub = _soc_pct;
     _soc_valid_pub = _soc_valid &&
         ZhiannBMS::fresh_ms(now_ms, _soc_valid_ms, AP_BATT_MONITOR_TIMEOUT);
-    _has_current = _current_seen;
+    _has_current = _current_seen && !_current_fault;
     _has_temperature = ZhiannBMS::fresh_ms(now_ms,
                                            _interim_state.temperature_time,
                                            AP_BATT_MONITOR_TIMEOUT);
@@ -655,7 +786,7 @@ void AP_BattMonitor_ZhiannBMS::log_zbms()
                           (_current_seen ? 16U : 0) |
                           (_unmapped_active ? 32U : 0) |
                           (_coherence_fault ? 64U : 0) |
-                          (_severe_alarm_latched ? 128U : 0);
+                          (_current_fault ? 128U : 0);
     const uint64_t now_us = AP_HAL::micros64();
     const uint64_t age_ms_64 = (now_us - _last_frame_us) / 1000ULL;
     const uint16_t age_ms = age_ms_64 > UINT16_MAX ? UINT16_MAX :

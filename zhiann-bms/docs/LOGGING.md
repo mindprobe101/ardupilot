@@ -30,19 +30,20 @@ heard. With `LOG_DISARMED=1` they record without arming.
 Flag bits: bit0 = healthy, bit1 = standby (SOC frames flowing, detail
 frames stopped), bit2 = duplicate-node collision active, bit3 = SOC came
 from the fine 0.1% frame (else the coarse 1% frame), bit4 = current has
-been seen in the current pack session, bit5 = an unmapped physical pack is
-live, bit6 = a held coherence fault (PACK differs by more than 1 V from the
-atomic 24-cell sum or from the SOC-frame voltage mirror), bit7 = a severe
-alarm remains latched even if its raw frame has aged out.
+ever been seen from the pack, bit5 = an unmapped physical pack is
+live, bit6 = a held coherence fault (PACK differs by more than 1 V from
+the atomic 24-cell sum or from a recent SOC-frame voltage mirror, on two
+consecutive checks), bit7 = the last PACK current reading was implausible
+(voltage is still accepted; has_current is held false while it persists).
 
 Alarm/Warning word bits (vendor spec table 19): B15 discharge
 overcurrent, B14 battery damaged, B13 AFE fault, B12 low temperature,
 B11 high temperature, B10 cell undervoltage, B9 cell overvoltage,
-B8 temperature sensor fault, B0 charge overcurrent. Any active Alarm bit
-holds the instance unhealthy; B14|B13 remain latched. Because source-address
-to pack-node mapping is unverified, every alarm is delivered to every
-configured instance. A single-pack explicit clear can clear the latch; on a
-multi-pack bus a severe latch requires FC reboot.
+B8 temperature sensor fault, B0 charge overcurrent. Alarms are messages
+only: they are logged, mapped to the MAVLink fault bitmask and repeated
+to the GCS every 10 s while active, but they never gate the health flag.
+Because source-address to pack-node mapping is unverified, every alarm is
+delivered to every configured instance as an unexpired union.
 
 ### ZBC1 / ZBC2 — full cell voltages
 
@@ -70,7 +71,14 @@ coherent snapshot. MAVLink can carry only 14 cells; dataflash retains all 24.
 | `ZhiannBMS: duplicate pack on node N` | two or more packs share node N; that instance's data is a mixture and is held unhealthy | do not fly; fix node claims (see LEARNINGS) |
 | `ZhiannBMS: pack on node N not mapped to any battery` | a pack is broadcasting on a node no BATTn_SERIAL_NUM points at; all configured instances are held unhealthy while it remains live | do not fly; adjust BATTn_SERIAL_NUM / instance count |
 | `ZhiannBMS: pack on node N in standby` | pack present (SOC frames flowing) but not enabled (detail frames stopped) | press the pack's power button |
-| `ZhiannBMS: incoherent data on node N` | PACK differs by more than 1 V from an atomic 24-cell sum or a recent SOC voltage mirror; the fault is held until a clean run | do not fly; inspect node claims and raw log |
+| `ZhiannBMS: incoherent data on node N` | PACK differs by more than 1 V from an atomic 24-cell sum or a recent SOC voltage mirror on two consecutive checks; the fault is held until a clean run | do not fly; inspect node claims and raw log |
+| `ZhiannBMS: BMS alarm: <names>` | the BMS alarm word has active bits; repeated every 10 s while active | act on the named alarms before flight |
+| `ZhiannBMS: implausible current from pack on node N` | PACK current failed plausibility; voltage is kept, current/consumption are frozen and has_current is false while it persists | inspect the pack; current-based failsafes are degraded |
+| `ZhiannBMS: temperature sensor fault on node N` | both temperature sensors read implausibly; no temperature update | inspect the pack temperature sensors |
+| `ZhiannBMS: pack on node N reports M cells, expected 24` | the pack's cell-count word is not 24, so cell voltages never publish | verify pack model/firmware |
+| `ZhiannBMS: BATTx_SERIAL_NUM invalid` | serial outside -1..15 (once per boot) | fix the parameter |
+| `ZhiannBMS: BATTx_SERIAL_NUM duplicates BATTy` | two instances claim the same node (once per boot) | fix the parameters |
+| `ZhiannBMS: protocol on multiple CAN ports; only first is used` | CAN_Dn_PROTOCOL selects ZhiannBMS on more than one driver slot (once per boot) | configure the protocol on exactly one port |
 
 MAVLink BATTERY_STATUS notes: only 14 of 24 cells fit; ArduPilot spreads
 the remaining voltage across the shown cells so their sum equals pack
