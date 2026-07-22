@@ -92,8 +92,9 @@ this file is the operational knowledge.
   against an analog power module: plateaus 2.05±0.05 mA/LSB), discharge
   negative on the wire, zero-deadband below a few amps, ~2 Hz filtered.
   `BATTn_CURR_MULT` trims residual scale error.
-- SOC: 0.1 % resolution in the temp/SOC frame, 1 % copy at 5 Hz in the
-  SOC frame (also carries voltage×320 mirror). New/replaced packs may
+- SOC: 0.1 % resolution in the temp/SOC frame, 1 % copy in byte 0's low
+  seven bits at 5 Hz (bit 7 and byte 1 are dynamic status; the frame also
+  carries a voltage×320 mirror). New/replaced packs may
   need minutes for their SOC estimate to settle (observed 90→96 %).
 - Temperatures: two sensors in the broadcast (0.1 °C, assumed signed);
   eight per-cell sensors available via polled PF 0x82 (1 °C, offset −40).
@@ -112,18 +113,21 @@ this file is the operational knowledge.
 | `silence_test.py` | wall-clock-tagged logging with per-minute status |
 | `pack_info.py` | fleet query: IDs, serials, models, cycles, temps |
 | `log_bms_load.py` / `analyze_bms_load.py` / `correlate_ap_bms.py` | load-test capture, marker analysis, ArduPilot-log correlation (current calibration) |
-| `zhiann-bms/` (in ardupilot repo) | prebuilt firmware + param presets |
-| `libraries/AP_BattMonitor/tests/test_zhiann_decode.cpp` | replay regression tests (11 cases, real frames) |
+| `zhiann-bms/` (in ardupilot repo) | reviewed firmware, manifest + mapping templates |
+| `libraries/AP_BattMonitor/tests/test_zhiann_decode.cpp` | replay/boundary regression tests (21 cases) |
 
 ## 6. ArduPilot driver capabilities (branch Copter-4.6.3-zhiann-bms)
 
-Voltage, current (+consumed mAh/Wh), 24 cells (14 live via MAVLink, all
-24 in dataflash), both temps (max reported), BMS SOC with coulomb-count
-fallback, alarm-frame fault mapping (severe alarms block arming),
-duplicate-node detection (unhealthy + GCS warning), standby detection
-("press the pack button" hint), unmapped-node warning (claim migration),
-per-node fleet inventory at boot, RX-only by policy. Multi-pack via
+Voltage, current, consumed mAh/Wh initialized from BMS SOC and then kept at
+the conservative maximum of the SOC-derived floor and current integration,
+24 cells (14 live via MAVLink, all 24 in dataflash), both temps (max
+reported), and fresh BMS SOC. The safety path requires five clean PACK
+intervals plus a fresh atomic 24-cell snapshot; it checks PACK against both
+the cell sum and SOC voltage mirror, rejects implausible values, maps alarm
+faults, detects duplicate nodes/standby/unmapped packs, and is RX-only.
+Multi-pack via
 BATTn_SERIAL_NUM = node or -1 auto-bind, up to node 15 / 9 instances.
+`BATTn_SERIAL_NUM` is snapshotted at initialization; reboot after changing it.
 
 ## 7. Vendor situation
 
@@ -138,8 +142,11 @@ for the boot-race duplicate claims (with the RAM-vs-NVM detail).
 ## 8. Open questions
 
 - Whether newer pack firmware fixes boot-claim arbitration (vendor).
-- Alarm frame (PF 0x24) real-world bit behaviour — never observed live.
-- 0x401A100 word at offset 4 (temperature-like), 0x2E0943 word 0,
+- Alarm frame (PF 0x24) real-world bit/source/clear behaviour — never
+  observed live. Until verified, alarms are fanned out conservatively; on a
+  multi-pack bus severe faults remain latched until FC reboot.
+- 0x401A100 byte0 bit7/byte1 status, word at offset 4 (temperature-like),
+  0x2E0943 word 0,
   0x2E0951 word 0 (counter/CRC-like), 0x402A100 tail bytes.
 - Broadcast temp signedness below 0 °C (assumed s16).
 - Exact current scale to <1 % (needs a clamp-meter reference).
