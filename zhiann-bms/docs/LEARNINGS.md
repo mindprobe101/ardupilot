@@ -84,12 +84,19 @@ Measured signatures, all independent of each other:
 | signal | one pack | two packs |
 |---|---|---|
 | SOC-coarse frame `0x401A10n` | 4.5/s (201 ms) | 9/s (70-104 ms) |
-| detail frame `0x2E09(0x51+0x20n)` | 2/s (508 ms) | 4/s |
+| detail frame `0x2E09(0x51+0x20n)` | 2/s (508 ms) | 4/s, as 40 ms + 468 ms |
 | temp/SOC frame payloads | one cluster | two clusters, ~50/50 |
 
 The SOC-coarse cadence is the primary signal: every pack emits it on its own
 node, and it doubles while the second pack is still in **standby**, roughly
 150 s before the detail frames double.
+
+Two packs on one node do **not** split the period evenly. They hold a locked
+phase offset, so the merged stream alternates a short gap with a long one —
+median 40 ms + 468 ms on the detail frames, 36 ms minimum. Any detector floor
+meant to reject retransmit bursts therefore has only ~16 ms of headroom below
+the real collision signature, which is why the floor is 20 ms and must not be
+raised.
 
 Two traps that cost real effort and will catch anyone repeating this analysis:
 
