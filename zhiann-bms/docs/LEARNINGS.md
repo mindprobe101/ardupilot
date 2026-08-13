@@ -36,34 +36,86 @@ this file is the operational knowledge.
 
 ## 2. Node claims — the central problem
 
-- Each pack claims a node index (0..15 possible; 0-4 seen) that prefixes
-  all its broadcast IDs. ArduPilot maps `BATTn_SERIAL_NUM` to this node.
-- **Claim arbitration runs only at boot.** Membership changes (a pack
-  joining) can force a runtime re-arbitration — but that result lives in
-  RAM ONLY and is lost when packs deep-sleep. The NVM (persisted) claims
-  are what boots re-load, and those can collide: we observed two and even
-  THREE packs simultaneously broadcasting as node 2.
-- **Nothing sendable over the bus rewrites the NVM claim.** Exhaustively
-  tried and failed: synchronized boots, staggered off-bus boots,
-  hot-rejoin while running, cold-boot onto a live bus with the node
-  audibly occupied, PF 0x07 address assignment with and without
-  sustained heartbeats (lease decays; pack pauses ~7-15 s then rejoins
-  its old node; no 0x08 ack), settings-write path (no CAN_IDX setting
-  exists in fw 2.01.0003; settings scan 1..200 answered only
-  model/serial/versions).
-- Boot draws are **non-deterministic**: the same fleet gave
-  {0,1,2,2,-} one morning and a clean {0,1,2,3,4} the same evening.
-  A clean draw is luck, not a fix, until the vendor provides a tool.
-- The vendor's patent (CN118101624B) describes duplicate-detection +
-  UID-rank re-arbitration; this firmware demonstrably does not implement
-  it at boot (bit-synchronized identical announcements may be why packs
-  never "hear" each other in the race).
-- **NEVER transmit the master heartbeat (PF 0x43)**: continuous
-  heartbeats made packs power themselves off, and a registered-bitmap
-  omitting a momentarily-silent pack caused it to release its node and
-  persistently re-join on an occupied one — this incident created the
-  whole collision mess. (Bitmap appears to act as the allowed-node set
-  for packs booting under a master.)
+- Each pack broadcasts on a node index (0..15 possible; 0-4 seen) that
+  prefixes all its IDs. ArduPilot maps `BATTn_SERIAL_NUM` to this node.
+- **Each pack has a preferred node.** It takes that node when free and falls
+  back to another when it is occupied. Fallbacks are remembered, so the same
+  pack set tends to reproduce the same allocation on every boot.
+- **Two packs can end up on the same node**, and then stay there for as long
+  as that pack set keeps being used. Two and even three packs have been seen
+  broadcasting as node 2 simultaneously. Change the pack set and it can
+  resolve; nothing on the bus resolves it in place.
+- **Nothing sendable over the bus rewrites a claim.** Exhaustively tried and
+  failed: synchronized boots, staggered off-bus boots, hot-rejoin while
+  running, cold-boot onto a live bus with the node audibly occupied, PF 0x07
+  address assignment with and without sustained heartbeats, and the
+  settings-write path (no CAN_IDX setting exists in fw 2.01.0003; a settings
+  scan of 1..200 answered only model/serial/versions).
+- **A vendor flight controller does not help.** With a V10Pro running on the
+  bus throughout, collisions still formed and were never repaired; it simply
+  reported one pack where two existed. It is powered *from* the packs, so its
+  first frame always arrives 1.6-17 s after they start transmitting — it
+  cannot be present when a claim is made.
+- **Pre-waking every pack improves the odds but is not a fix.** A short press
+  wakes a pack's controller (SOC LEDs light) without powering it; a long press
+  then powers it on. Short-pressing every pack before powering one on produced
+  a clean four-node allocation three times out of five. It is worth doing, but
+  it is not reliable and must not be treated as a guarantee.
+- **Unexplained:** on 2026-08-14 a pack claimed node 2 a full **26 s** after
+  another pack was established and broadcasting there. A simultaneous-claim
+  race does not account for that, and no mechanism is yet known.
+- **Always verify the node map before arming.** This is the only dependable
+  step: confirm the expected number of distinct battery instances appears. If
+  one is missing or flagged duplicate, power fully down and repeat.
+- The permanent fix is distinct stored nodes per pack, reachable only through
+  the ZhianLink USB-C tool, not over CAN. This is the outstanding vendor ask,
+  along with whether firmware after 2.01.0003 implements the UID-rank
+  arbitration described in patent CN118101624B (this one demonstrably does
+  not).
+- **NEVER transmit the master heartbeat (PF 0x43)**: continuous heartbeats
+  made packs power themselves off, and a registered-bitmap omitting a
+  momentarily-silent pack caused it to release its node and re-join on an
+  occupied one.
+
+### Detecting a duplicate
+
+Measured signatures, all independent of each other:
+
+| signal | one pack | two packs |
+|---|---|---|
+| SOC-coarse frame `0x401A10n` | 4.5/s (201 ms) | 9/s (70-104 ms) |
+| detail frame `0x2E09(0x51+0x20n)` | 2/s (508 ms) | 4/s |
+| temp/SOC frame payloads | one cluster | two clusters, ~50/50 |
+
+The SOC-coarse cadence is the primary signal: every pack emits it on its own
+node, and it doubles while the second pack is still in **standby**, roughly
+150 s before the detail frames double.
+
+Two traps that cost real effort and will catch anyone repeating this analysis:
+
+- **A pack alone on the bus storms retransmits at ~4 ms**, because nothing
+  ACKs it. Those gaps carry no cadence information and must be discarded, or
+  every single pack reads as a duplicate. Worse, when something *starts*
+  ACKing, the storm breaks into bursts whose **exit gaps** (53–135 ms measured)
+  land squarely in the doubled band. That is the normal power-on order for the
+  aircraft, and it is the only false positive the corpus contains.
+- **A single pack dithers temperature by exactly 1.0 °C at ~1 Hz**, which reads
+  as two payload clusters if you use temperature as ground truth. Use the
+  pack-voltage mirror instead; it caught every real episode.
+
+Cadence alone is also structurally blind to roughly 20 % of possible phase
+alignments between two packs (an offset under ~20 ms merges into the retransmit
+band), and the observed offsets were **locked**, not drifting — two of the four
+pack-pairs sat at 36 ms, only 16 ms from that blind zone. The identity signal
+is a necessary complement, not a formality.
+
+The 2 s frame `0x402A10n` carries a stable per-pack identity in bytes 4..7,
+useful for naming which packs collided — but **not every occupied node emits
+it**, and the rule governing which do is not known. Node 0 emitted it in all
+seven captures; other nodes emitted it inconsistently, and in one capture three
+nodes emitted concurrently while an occupied fourth stayed silent. Two of the
+three real collisions in the corpus produced no identity frames at all, so it
+cannot be relied on to detect a collision — only to name one already found.
 
 ## 3. Operating procedures that work
 
@@ -88,10 +140,19 @@ this file is the operational knowledge.
 
 ## 4. Current, SOC and sensors (calibrated facts)
 
-- Current: s32 LE in the pack-voltage frame, **2 mA/LSB** (calibrated
-  against an analog power module: plateaus 2.05±0.05 mA/LSB), discharge
-  negative on the wire, zero-deadband below a few amps, ~2 Hz filtered.
-  `BATTn_CURR_MULT` trims residual scale error.
+- Current: s32 LE in the pack-voltage frame, discharge negative on the
+  wire, zero-deadband below a few amps, ~2 Hz filtered.
+  **The scale is 1 mA/LSB**, which the driver now decodes directly, so
+  `BATTn_CURR_MULT` stays at its 1.0 default. The original 2 mA/LSB came from
+  correlating against an analog power module whose own calibration was the
+  weak link. Three independent lines agree: coulomb-counting 14 pack-flights
+  against the packs' own SOC; the vendor flight controller's decode of the
+  same field; and the pack broadcasting its **own rated capacity of 44.0 Ah**
+  in the `4E0958` frame. At 1 mA/LSB the packs measure ~41 Ah, i.e. ~94 % of
+  rated, normal for used cells.
+  Beware when re-measuring: flights confined to high SOC (100->75 %)
+  under-estimate capacity badly, because the BMS SOC falls faster than real
+  coulombs near full charge. Use sweeps of >=30 % SOC only.
 - SOC: 0.1 % resolution in the temp/SOC frame, 1 % copy in byte 0's low
   seven bits at 5 Hz (bit 7 and byte 1 are dynamic status; the frame also
   carries a voltage×320 mirror). New/replaced packs may
@@ -106,14 +167,15 @@ this file is the operational knowledge.
 
 | Tool | Purpose |
 |---|---|
-| `can_sniffer/` firmware | Nucleo bitrate-autodetect sniffer + TX passthrough (`T,<id>,<hex>` over VCP) |
+| `can_sniffer/` firmware | Nucleo sniffer. Currently a **listen-only** build: locked to 1 Mbit/s, FDCAN bus-monitoring mode, so it cannot ACK or transmit and cannot perturb an observed system. Restore the probe + `FDCAN_MODE_NORMAL` in `main()` if the TX passthrough (`T,<id>,<hex>` over VCP) is needed |
+| `capture_v10pro.py` | wall-clock timestamped raw capture to file |
 | `can_sniffer/scripts/capture.py` | raw capture to file |
 | `can_sniffer/scripts/decode.py` | protocol decoder / live summary |
 | `bms_dashboard.py` | live web view (localhost:8787) + simultaneous logging |
 | `silence_test.py` | wall-clock-tagged logging with per-minute status |
 | `pack_info.py` | fleet query: IDs, serials, models, cycles, temps |
 | `log_bms_load.py` / `analyze_bms_load.py` / `correlate_ap_bms.py` | load-test capture, marker analysis, ArduPilot-log correlation (current calibration) |
-| `zhiann-bms/` (in ardupilot repo) | reviewed firmware, manifest + mapping templates |
+| `zhiann-bms/` (in ardupilot repo) | protocol/ops documentation + parameter mapping templates |
 | `libraries/AP_BattMonitor/tests/test_zhiann_decode.cpp` | replay/boundary regression tests (21 cases) |
 
 ## 6. ArduPilot driver capabilities (branch Copter-4.6.3-zhiann-bms)
@@ -147,6 +209,20 @@ for the boot-race duplicate claims (with the RAM-vs-NVM detail).
   multi-pack bus severe faults remain latched until FC reboot.
 - 0x401A100 byte0 bit7/byte1 status, word at offset 4 (temperature-like),
   0x2E0943 word 0,
-  0x2E0951 word 0 (counter/CRC-like), 0x402A100 tail bytes.
+  0x2E0951 word 0 (counter/CRC-like).
 - Broadcast temp signedness below 0 °C (assumed s16).
-- Exact current scale to <1 % (needs a clamp-meter reference).
+- Current scale is 1 mA/LSB (§4); a clamp meter would still pin it to <1 %.
+- Node assignment RESOLVED 2026-08-13 (§2): stored in the pack and claimed
+  unconditionally; same-node packs always collide and nothing on the bus can
+  fix it. Remaining ask is the ZhianLink parameter that writes it.
+- Semantics of the per-pack value in `402A10n[4..7]` (serial hash? checksum?),
+  and whether it is unique fleet-wide — needed before leaning on it hard.
+- Whether a displaced pack that goes silent is genuinely still powered — if
+  so, an unmonitored live pack is a real hazard needing a driver response.
+- Whether replaying the FC's 1 Hz keepalive alone unlocks the `3E`/`4E`/`5E`
+  identity/nameplate/SOH blocks for our driver. Requires TX; **not to be
+  attempted without an explicit decision** given the July heartbeat incident.
+  Note the FC's keepalive carries no membership bitmap, which is what made
+  the July attempt harmful.
+- Whether the FC can repair an *existing* duplicate-node condition rather than
+  merely never provoking one. Needs the known-colliding pack set on that bus.

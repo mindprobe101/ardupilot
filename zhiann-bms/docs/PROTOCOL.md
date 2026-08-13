@@ -42,9 +42,9 @@ two independent SOC fields agreed, cell count field matched frame layout).
 | 0x2E0946 | 500 ms | cells 11-14 (mV) |
 | 0x2E0947 | 500 ms | cells 15-18 (mV) |
 | 0x2E094A | 500 ms | cells 23-24 (mV), only 4 bytes |
-| 0x2E0951 | 500 ms | u16 counter/crc, pack voltage (10 mV), **current: s32 LE, 2 mA/LSB, negative = discharge** |
+| 0x2E0951 | 500 ms | u16 counter/crc, pack voltage (10 mV), **current: s32 LE, 1 mA/LSB, negative = discharge** |
 | 0x401A100 | 200 ms | SOC = byte 0 low 7 bits (%); byte 0 bit 7 + byte 1 are dynamic status; pack voltage mirror (u16, 1/320 V); u16 slow-rising with load (temperature? 17→19); 0 |
-| 0x402A100 | 2 s | u16 zeros, current coarse copy (s16 LE, 0.2 A/LSB), FF FF, const u16 (serial/crc?) |
+| 0x402A10n | 2 s | u16 zeros, current coarse copy (s16 LE), then a **stable per-pack identity in bytes 4..7** (wire order, e.g. `FFFF5B8C`) |
 
 Frame order within the 500 ms burst: 51, 42, 43, 44, 45, 46, 47, 41, 4A.
 
@@ -52,11 +52,14 @@ Frame order within the 500 ms burst: 51, 42, 43, 44, 45, 46, 47, 41, 4A.
 
 Identified from `bms_load_20260718_201602.log` + ArduPilot log 00000058.BIN
 (different drone, analog power module on BAT instance 0, aligned via
-arm/disarm events, r2=0.937 continuous / plateau ratios 2.05±0.05 mA/LSB):
+arm/disarm events). That correlation gave 2 mA/LSB, but the power module's
+own calibration was the weak link; the scale was corrected to **1 mA/LSB**
+in 2026-08 from the pack's broadcast 44.0 Ah rated capacity and from coulomb
+counting flights against the packs' own SOC:
 
-- amps = -(s32 at 0x2E0951[4..7]) * 0.002  (positive = discharge)
+- amps = -(s32 at 0x2E0951[4..7]) * 0.001  (positive = discharge)
 - BMS reports exactly 0 below a few amps (deadband); updates ~2 Hz, filtered
-- 0x402A100 s16[2..3] is the same current at 0.2 A/LSB (ratio exactly 100)
+- 0x402A100 s16[2..3] is the same current at 0.1 A/LSB (ratio exactly 100)
 - 0x401A100[2..3] turned out to be voltage*320, NOT current
 - 0x401A100[4..5] crept 17→19 during load and stayed after: temperature-like
 
@@ -68,8 +71,12 @@ is node 0:
 - cell/temp/SOC-fine frames: `0x2E0941 + 0x20*n` .. (types +0..+6, +9)
 - pack voltage + current frame: `0x2E0951 + 0x20*n`
 - SOC coarse frame: `0x401A100 + n`
-- `0x402A100` appears only once on the bus (one transmitter, data format
-  differed from the single-pack capture - not used by any consumer)
+- 2 s identity frame: `0x402A100 + n`. **Not every occupied node transmits
+  it**, and the rule is not known: node 0 emitted it in all seven captures,
+  other nodes emitted it inconsistently, and in one capture three nodes emitted
+  concurrently while an occupied fourth stayed silent. Two of the three real
+  collisions in the corpus produced none at all, so it can name a colliding
+  pack but cannot be relied on to detect a collision.
 
 Node numbering initially appeared positional because the original pack moved
 to node 1 in the four-pack setup. Later collision/rejoin testing disproved
@@ -196,14 +203,55 @@ Driver implication: health keyed on the PACK_VOLT (detail) frame correctly
 reports a standby pack as unhealthy while its SOC frame still flows — a
 standby pack cannot pass arming. Basis for improvement #1 (standby GCS msg).
 
+## Master traffic and the polled profile (2026-08-13, V10Pro FC on the bus)
+
+Captured with a listen-only sniffer alongside a vendor V10Pro flight
+controller. Full analysis and raw logs:
+`can_bms/doc_source/2026-08-13-v10pro-master-bus-findings.md` and
+`can_bms/doc_source/v10pro-captures-20260813/`.
+
+Every ID below is absent from all our FC-free captures and appears only with
+the V10Pro present, i.e. it is master-originated:
+
+| ID | Rate | Role |
+|---|---|---|
+| `10015514` (SA 0x14) | 1 Hz forever | keepalive; bytes 0-1 rolling counter, byte 7 = byte 0 − 1, **no membership bitmap** |
+| `1803E814` (SA 0x14) | 2 Hz, first 14 s | startup enumeration (PF 0x03 identify) |
+| `1E0`, `559` | 5 Hz / 2 Hz, first 30 s / 10 s | startup handshake, **11-bit standard IDs** (packs only ever use 29-bit) |
+| `2E5039` / `2E5839` | 2 Hz | per-node poll, node 0 / node 1 |
+| `3E5039`, `4E5039`, `5E5039` (+ `58xx`) | ~0.1 Hz | polls for the identity / nameplate / SOH blocks |
+
+The pack answers a poll with a block that never appears on our RX-only bus:
+
+- `3E09xx` — ASCII identity: model `ZB3CN7…`, part/fw `ZAB2444-02-ZA01.02`,
+  and a **per-pack serial** (`B1VZ0019` etc). The only unique pack identifier
+  available without TX is the `402A10n`/`403A10n` tail (4-byte hardware id).
+- `4E0958` — u16 LE `[440, 8, 9000, 24]` = **rated capacity 44.0 Ah**, 8
+  temperature sensors, 90.00 V nominal, 24 cells.
+- `5E09xx` — SOH %, cycle count, capacity repeated.
+
+Membership is expressed by *which node slots the FC polls*, fixed at
+enumeration: after a cold boot with only node 1 present it polls only `…5839`;
+if a pack is hot-unplugged it keeps polling the empty node until the next boot.
+
+**The FC is powered from the packs**, so its first frame always arrives
+1.6-17 s after the packs start transmitting. It cannot be present when a pack
+chooses its node — it can only react afterwards.
+
+Bus behaviour worth knowing: a pack transmitting with nothing else on the bus
+retransmits each frame ~13x at ~4 ms spacing until something ACKs (seen at
+every power-on until the FC boots). `180DFFFE` (SA 0xFE, the J1939 null
+address, payload `F6C66C3B093993C4`) precedes each pack coming online and is
+identical for every pack, so it is a fixed announce, not a unique id.
+
 ## Unknowns / TODO
 
 - Exact meaning of 0x401A100[4..5] (temperature-like) and 0x2E0943[0..1].
 - First u16 of 0x2E0951 (counter/crc), 0x402A100 tail bytes.
-- Scale is within power-brick tolerance of exactly 2 mA/LSB; a clamp-meter
-  spot check would pin it further.
-- Meaning of byte 0 bit 7 and byte 1 in 0x401A10x; they vary under load and
-  wake/standby but are not part of SOC.
+- Current scale RESOLVED: 1 mA/LSB, decoded directly by the driver
+  (`BATTn_CURR_MULT` stays at 1.0). The pack broadcasts its own 44.0 Ah rated
+  capacity in `4E0958`, and coulomb counting against the packs' own SOC
+  agrees. A clamp meter would still pin it to <1 %.
 
 ## Consumers
 

@@ -18,14 +18,15 @@ heard. With `LOG_DISARMED=1` they record without arming.
 | Node | - | pack node this instance is bound to; -1 if not yet bound |
 | Flag | bitmask | see below |
 | Volt | V | pack voltage from the detail frame |
-| Curr | A | pack current, discharge positive (BMS 2 mA/LSB x CURR_MULT) |
+| Curr | A | pack current, discharge positive (BMS 1 mA/LSB x CURR_MULT) |
 | SOC | % | BMS-reported state of charge |
 | T1, T2 | degC | both temperature sensors (MAVLink/BAT gets only the max) |
 | Alm | bitmask | Alarm word from BMS PF 0x24; on multi-pack buses this is the unexpired conservative union of anonymous reports |
 | Warn | bitmask | Warning word from the same frame; likewise unioned and aged on multi-pack buses |
-| Vmir | raw | voltage mirror from the SOC frame; volts = Vmir / 320 |
-| NCel | - | cell count reported by the pack (24 for these packs) |
+| Vm | raw | voltage mirror from the SOC frame; volts = Vm / 320 (was `Vmir` before 2026-08-14) |
+| NC | - | cell count reported by the pack (24 for these packs; was `NCel` before 2026-08-14) |
 | Age | ms | time since the last detail frame (large = standby or lost) |
+| ID | raw | per-pack identity from the 2s frame — identifies WHICH physical pack is on this node. Printed as all 8 hex digits in GCS messages (e.g. `FFFFBDBD`) |
 
 Flag bits: bit0 = healthy, bit1 = standby (SOC frames flowing, detail
 frames stopped), bit2 = duplicate-node collision active, bit3 = SOC came
@@ -70,7 +71,9 @@ snapshot. MAVLink can carry only 14 cells; dataflash retains all 24.
 | Message | Meaning | Operator action |
 |---|---|---|
 | `ZhiannBMS: pack on node N` | fleet inventory: a pack was heard on node N (once per node per boot) | verify the set matches the packs you installed |
-| `ZhiannBMS: duplicate pack on node N` | two or more packs share node N; that instance's data is a mixture and is held unhealthy | do not fly; fix node claims (see LEARNINGS) |
+| `ZhiannBMS: duplicate node N: AAAAAAAA+BBBBBBBB` | two packs share node N, named by their pack ids; that instance's data is a mixture and is held unhealthy. Also raised in standby, before the packs are switched on | do not fly; separate those two packs, or re-run the short-press power-on procedure (see LEARNINGS) |
+| `ZhiannBMS: duplicate pack on node N` | as above but detected by frame cadence only, so the packs cannot be named | as above |
+| `ZhiannBMS: BATTx configured, only N packs on bus` | more `BATTn_MONITOR` instances configured than distinct nodes present — a configuration mismatch, not a failed pack | reduce the instance count, or find the missing/collided pack |
 | `ZhiannBMS: pack on node N not mapped to any battery` | a pack is broadcasting on a node no BATTn_SERIAL_NUM points at; all configured instances are held unhealthy while it remains live | do not fly; adjust BATTn_SERIAL_NUM / instance count |
 | `ZhiannBMS: pack on node N in standby` | pack present (SOC frames flowing) but not enabled (detail frames stopped) | press the pack's power button |
 | `ZhiannBMS: incoherent data on node N` | PACK differs by more than 1 V from an atomic 24-cell sum or a recent SOC voltage mirror on two consecutive checks of the same kind; the fault is held until a clean run | do not fly; inspect node claims and raw log |

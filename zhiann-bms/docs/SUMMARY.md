@@ -21,7 +21,7 @@ CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
   real captured frames with explicit synthetic boundary cases) -
   `./waf configure --board sitl` then build
   target `tests/test_zhiann_decode`.
-- **Ops assets** (this folder): hash-attested firmware and build manifest,
+- **Ops assets** (this folder): build instructions and
   2-pack/4-pack mapping templates, PROTOCOL.md / LOGGING.md / LEARNINGS.md,
   and a software-versus-bench VALIDATION.md report.
 - **Bench tooling** (developer machine, `~/can_bms`): NUCLEO-H753ZI
@@ -36,7 +36,7 @@ CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
    dual SOC fields, cell count field).
 2. Current field identified and calibrated by time-aligning a BMS capture
    with an ArduPilot dataflash log from a motor load test (alignment on
-   the shared pack-voltage waveform; plateau regression gave 2 mA/LSB).
+   the shared pack-voltage waveform; plateau regression; the scale was later corrected to 1 mA/LSB).
 3. Vendor spec V1.9 obtained later confirmed units and the polled command
    set; the broadcast profile itself is a customer profile absent from
    the spec (Appendix B stub) - our map remains the reference.
