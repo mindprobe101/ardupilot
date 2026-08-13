@@ -49,23 +49,31 @@ ZhiannBMS: pack on node 0            (once per node, as each is found)
 ZhiannBMS: 4 packs delivering        (once, after the bus stops growing)
 ZhiannBMS: a node carries 2 packs, count reads low
 ZhiannBMS: 3 of 4 packs, lost 1      (a pack stopped during the flight)
-ZhiannBMS: packs differ, V sd 2.3    (the packs stopped agreeing)
+ZhiannBMS: packs differ by 1.6 V     (the packs stopped agreeing)
 ```
 
 The last one is the check that averaging would otherwise hide: a mean says
 nothing about whether one pack has collapsed. The driver measures the **spread**
 (highest minus lowest) of pack voltage, current and state of charge and warns
-when it stops looking normal — thresholds 1.0 V, 15 %, 30 A.
+when it stops looking normal — thresholds 1.5 V, 15 %, 30 A.
 
 Spread, not standard deviation: standard deviation shrinks as packs are added,
 so the same physical fault would read 0.50x its size on two packs and 0.40x on
 five, and a fixed threshold would mean different things on different flights.
 The realistic failure — a pack whose contactor has opened, sitting at its
 unloaded voltage roughly 1.5 V above the loaded bus — is caught at 1.0 V spread
-but would not have reached any sane standard-deviation threshold. Four packs at
-rest measured a spread of 0.84 V, so the margin is deliberately narrow. Current
-is judged only once the set is delivering, because sharing at idle is
-meaningless and the BMS reports exactly 0 A below a few amps.
+but would not have reached any sane standard-deviation threshold. Current is
+judged only once the set is delivering, because sharing at idle is meaningless
+and the BMS reports exactly 0 A below a few amps.
+
+**The voltage threshold is not yet calibrated under load.** Four packs at rest
+measured a 0.84 V spread — pure BMS measurement offset, since no current
+flows — and 1.5 V is set at roughly twice that. Under load the healthy spread
+will widen with each pack's internal resistance, and nobody has measured by how
+much. Check the `DV` column against a real flight and adjust before trusting
+it. Note also that at rest an open-circuit pack is undetectable by any means:
+with no current flowing it reads the same voltage as the bus. The current
+spread is the decisive in-flight check.
 
 Health is simple: the battery is healthy while **at least one pack** is
 delivering complete, fresh data.

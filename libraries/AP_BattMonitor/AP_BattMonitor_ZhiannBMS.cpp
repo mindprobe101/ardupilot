@@ -123,15 +123,21 @@ static const struct {
 // value needed to reach any sane threshold cannot occur while the packs are
 // electrically tied in parallel.
 //
-// At rest four packs measured 102.09/102.38/102.58/102.93 V - a spread of
-// 0.84 V - so 1.0 V is close, deliberately: the failure this must catch is a
-// pack whose contactor has opened, which shows as its unloaded open-circuit
-// voltage sitting above the loaded bus by around a volt and a half. Anything
-// looser misses exactly that.
+// The failure this must catch is a pack whose contactor has opened, which
+// shows as its unloaded open-circuit voltage sitting above the loaded bus by
+// around a volt and a half.
+//
+// NOT CALIBRATED UNDER LOAD. At rest four packs measured a 0.84 V spread,
+// which is pure BMS measurement offset because no current is flowing, and
+// 1.5 V is roughly twice that. Under load the healthy spread widens with each
+// pack's internal resistance and nobody has measured by how much, so this may
+// need raising. The current spread is the decisive in-flight check; at rest an
+// open pack is undetectable by any means, since with no current it reads the
+// same voltage as the bus.
 //
 // Current is only judged once the set is actually delivering, because sharing
 // at idle is meaningless and the BMS reports exactly 0 A below a few amps.
-#define ZHIANN_IMBALANCE_V_SPREAD    1.0f    // volts
+#define ZHIANN_IMBALANCE_V_SPREAD    1.5f    // volts
 #define ZHIANN_IMBALANCE_SOC_SPREAD  15.0f   // percent
 #define ZHIANN_IMBALANCE_I_SPREAD    30.0f   // amps
 #define ZHIANN_IMBALANCE_I_FLOOR     20.0f   // mean amps before current judged
