@@ -19,15 +19,22 @@ Written at 2 Hz. With `LOG_DISARMED=1` they record without arming.
 | Curr | A | total current, summed across the packs, discharge positive |
 | SOC | % | mean state of charge |
 | Temp | degC | highest pack temperature |
+| DV | V | pack voltage **spread** (highest minus lowest) — this is what the imbalance warning uses |
+| DA | A | pack current spread |
+| DS | % | pack state of charge spread |
 | SDV | V | standard deviation of pack voltage across the set |
 | SDA | A | standard deviation of pack current |
 | SDS | % | standard deviation of pack state of charge |
 | Alm | bitmask | alarm word from BMS PF 0x24; the alarm frame is anonymous, so this is the unexpired union across packs |
 | Warn | bitmask | warning word from the same frame, likewise unioned and aged |
 
-The three `SD` columns are the ones to look at first after any battery
-complaint: the aggregate can look perfectly healthy while one pack is failing,
-and the spread is what shows it.
+The `D*` columns are the ones to look at first after any battery complaint:
+the aggregate can look perfectly healthy while one pack is failing, and the
+spread is what shows it. Spread rather than standard deviation drives the
+warning because standard deviation shrinks as packs are added — the same
+physical fault reads 0.50x its size on two packs and 0.40x on five — so a
+fixed threshold would mean different things on different flights. The standard
+deviations are logged alongside for reference.
 
 ### ZBND — the per-node readings behind the aggregate
 
@@ -38,6 +45,7 @@ after the fact.
 |---|---|---|
 | TimeUS | us | boot-relative timestamp |
 | Node | - | proprietary broadcast node (0-15) |
+| Ctb | - | 1 = this node was included in the published aggregate. A node can be present (SOC frames arriving) but not contributing, e.g. a pack in standby |
 | Volt | V | this pack's voltage |
 | Curr | A | this pack's current, discharge positive |
 | SOC | % | this pack's state of charge |
@@ -82,7 +90,8 @@ pack. It is what a post-flight investigation into one bad pack starts from.
 | `ZhiannBMS: N packs delivering` | once per boot, after the bus stops growing: how many packs are supplying complete data | **check against the packs you loaded** — this is the preflight step |
 | `ZhiannBMS: a node carries 2 packs, count reads low` | two packs share a node, so the count above is one short of the packs present. Their data is interleaved and averaged in together | fine to fly; fix the collision when convenient by power-cycling the packs, or with the vendor ZhianLink tool |
 | `ZhiannBMS: N of M packs, lost K` | a pack that was delivering has stopped; the rest now carry its share | land and investigate; the aircraft keeps flying on the remaining packs |
-| `ZhiannBMS: packs differ, V sd 2.3` | the spread across packs (voltage, current or state of charge) exceeded its threshold — one pack is not behaving like the others | land and investigate; check ZBND to see which node |
+| `ZhiannBMS: packs differ by 1.6 V` | the spread across packs (voltage, current or state of charge) exceeded its threshold — one pack is not behaving like the others | land and investigate; check ZBND to see which node |
+| `ZhiannBMS: set BATTx_MONITOR=0, one instance only` | more than one battery monitor is set to this type; only the first does anything and the rest are held unhealthy | set the extra instances to 0 and reboot |
 | `ZhiannBMS: BMS alarm: <names>` | the BMS alarm word has active bits; repeated every 10 s while active | act on the named alarms before flight |
 | `ZhiannBMS: protocol on multiple CAN ports; only first is used` | CAN_Dn_PROTOCOL selects ZhiannBMS on more than one driver slot | configure the protocol on exactly one port |
 

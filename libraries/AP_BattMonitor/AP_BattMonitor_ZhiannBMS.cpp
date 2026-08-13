@@ -113,16 +113,28 @@ static const struct {
 // before announcing how many were found.
 #define ZHIANN_BUS_SETTLE_MS  5000
 
-// Imbalance reporting. The packs sit in parallel, so at rest they track each
-// other closely: four packs measured 102.09/102.38/102.58/102.93 V, a
-// standard deviation of 0.31 V. These thresholds sit well clear of that so
-// they mean something when they fire. Current is only judged once the set is
-// actually delivering, because sharing at idle is meaningless and the BMS
-// reports exactly 0 A below a few amps.
-#define ZHIANN_IMBALANCE_V_SD     1.5f    // volts
-#define ZHIANN_IMBALANCE_SOC_SD   8.0f    // percent
-#define ZHIANN_IMBALANCE_I_SD     20.0f   // amps
-#define ZHIANN_IMBALANCE_I_FLOOR  20.0f   // total amps before current is judged
+// Current is summed and integrated, so a stale reading is charge the aircraft
+// never drew. Two missed detail frames.
+#define ZHIANN_CURRENT_FRESH_MS  1500
+
+// Imbalance reporting, on SPREAD (max - min) rather than standard deviation.
+// Standard deviation shrinks as packs are added, so a fixed threshold would
+// mean something different on a two-pack flight than a five-pack one, and the
+// value needed to reach any sane threshold cannot occur while the packs are
+// electrically tied in parallel.
+//
+// At rest four packs measured 102.09/102.38/102.58/102.93 V - a spread of
+// 0.84 V - so 1.0 V is close, deliberately: the failure this must catch is a
+// pack whose contactor has opened, which shows as its unloaded open-circuit
+// voltage sitting above the loaded bus by around a volt and a half. Anything
+// looser misses exactly that.
+//
+// Current is only judged once the set is actually delivering, because sharing
+// at idle is meaningless and the BMS reports exactly 0 A below a few amps.
+#define ZHIANN_IMBALANCE_V_SPREAD    1.0f    // volts
+#define ZHIANN_IMBALANCE_SOC_SPREAD  15.0f   // percent
+#define ZHIANN_IMBALANCE_I_SPREAD    30.0f   // amps
+#define ZHIANN_IMBALANCE_I_FLOOR     20.0f   // mean amps before current judged
 
 const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 
@@ -241,16 +253,14 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: pack on node %u",
                       unsigned(cls.node));
     }
-    n.seen = true;
     n.last_ms = now_ms;
 
-    handle_frame(n, cls.node, cls.type, frame);
+    handle_frame(n, cls.type, frame);
     return true;
 }
 
 // file one decoded frame into its node's state (CAN driver thread, _sem held)
-void AP_BattMonitor_ZhiannBMS::handle_frame(Node &n, uint8_t node_num,
-                                            uint8_t frame_type,
+void AP_BattMonitor_ZhiannBMS::handle_frame(Node &n, uint8_t frame_type,
                                             const AP_HAL::CANFrame &frame)
 {
     const uint8_t *d = frame.data;
@@ -264,7 +274,7 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(Node &n, uint8_t node_num,
             n.voltage = voltage;
             n.detail_ms = now_ms;
         }
-        const float current = ZhiannBMS::current_amps(d) * _curr_mult.get();
+        const float current = ZhiannBMS::current_amps(d) * _curr_mult_cached;
         if (ZhiannBMS::current_valid(current)) {
             n.current = current;
         }
@@ -319,41 +329,46 @@ void AP_BattMonitor_ZhiannBMS::handle_frame(Node &n, uint8_t node_num,
         }
         break;
     }
-    (void)node_num;
 }
 
 // Reduce every fresh node to one battery. Returns how many packs contributed.
 uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
 {
-    float v_sum = 0, i_sum = 0, soc_sum = 0, t_max = 0;
-    float v_sq = 0, i_sq = 0, soc_sq = 0;
+    // Gathered first and reduced second: the imbalance test needs the extremes
+    // anyway, and a running sum of squares would lose the spread to float
+    // cancellation at ~102V (see ZhiannBMS::reduce).
+    float v[ARRAY_SIZE(_nodes)], amps[ARRAY_SIZE(_nodes)], soc[ARRAY_SIZE(_nodes)];
     uint32_t cell_sum[24] {};
-    uint8_t live = 0, with_cells = 0, with_temp = 0, with_current = 0;
+    uint8_t live = 0, n_current = 0, n_soc = 0, with_cells = 0, with_temp = 0;
+    float t_max = 0;
     _dup_any = false;
 
     for (uint8_t node = 0; node < ARRAY_SIZE(_nodes); node++) {
         Node &n = _nodes[node];
+        n.contributing = false;
         if (!ZhiannBMS::fresh_ms(now_ms, n.last_ms, ZHIANN_NODE_TIMEOUT_MS)) {
             continue;
         }
         if (n.dup.active(now_ms) || n.identity.active(now_ms)) {
             _dup_any = true;
         }
-        // a node with no pack voltage yet is present but not contributing
-        // (a pack in standby broadcasts SOC only)
+        // present but not contributing: a pack in standby broadcasts SOC only
         if (!ZhiannBMS::fresh_ms(now_ms, n.detail_ms, ZHIANN_NODE_TIMEOUT_MS)) {
             continue;
         }
-        live++;
-        v_sum += n.voltage;
-        v_sq += n.voltage * n.voltage;
-        i_sum += n.current;
-        i_sq += n.current * n.current;
-        with_current++;
+        n.contributing = true;
+        v[live++] = n.voltage;
+
+        // Current is summed and then integrated, so a stale value is charge
+        // the aircraft never drew. Hold it to a much tighter window than
+        // membership: a pack sends this frame every ~508ms, so 1.5s is two
+        // missed frames. Beyond that the pack drops out of the total rather
+        // than contributing a reading that is no longer true.
+        if (ZhiannBMS::fresh_ms(now_ms, n.detail_ms, ZHIANN_CURRENT_FRESH_MS)) {
+            amps[n_current++] = n.current;
+        }
         if (ZhiannBMS::fresh_ms(now_ms, n.soc_ms, ZHIANN_NODE_TIMEOUT_MS)) {
-            const float soc = n.soc_tenths * 0.1f;
-            soc_sum += soc;
-            soc_sq += soc * soc;
+            soc[n_soc++] = n.soc_tenths * 0.1f;
         }
         if (ZhiannBMS::fresh_ms(now_ms, n.temp_ms, ZHIANN_NODE_TIMEOUT_MS)) {
             if (with_temp == 0 || n.temperature > t_max) {
@@ -380,26 +395,34 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
         _has_cell_voltages = false;
         _has_temperature = false;
         _soc_valid = false;
-        _sd_voltage = _sd_current = _sd_soc = _mean_current = 0;
+        // _has_current is deliberately left alone: it says the pack set is
+        // capable of reporting current, not that a reading is available now.
+        _sd_voltage = _sd_current = _sd_soc = 0;
+        _spread_voltage = _spread_current = _spread_soc = 0;
+        _mean_current = 0;
         memset(_state.cell_voltages.cells, 0xFF,
                sizeof(_state.cell_voltages.cells));
+        // force the next sample to re-seed rather than integrate the outage
         _consumed_us = 0;
         return 0;
     }
 
-    const float inv = 1.0f / live;
-    _state.voltage = v_sum * inv;
-    _state.current_amps = i_sum;      // parallel packs: the set draws the sum
-    _mean_current = i_sum * inv;
-    _sd_voltage = ZhiannBMS::stdev(v_sum, v_sq, live);
-    _sd_current = ZhiannBMS::stdev(i_sum, i_sq, live);
+    float mean_v, mean_i, mean_soc;
+    ZhiannBMS::reduce(v, live, mean_v, _spread_voltage, _sd_voltage);
+    ZhiannBMS::reduce(amps, n_current, mean_i, _spread_current, _sd_current);
+    ZhiannBMS::reduce(soc, n_soc, mean_soc, _spread_soc, _sd_soc);
 
-    _soc_valid = false;
-    if (soc_sum > 0 || live > 0) {
-        const float soc_mean = soc_sum * inv;
-        _soc_pct = uint8_t(constrain_float(soc_mean + 0.5f, 0, 100));
-        _sd_soc = ZhiannBMS::stdev(soc_sum, soc_sq, live);
-        _soc_valid = true;
+    _state.voltage = mean_v;
+    // parallel packs: the set draws the sum of what its packs report
+    _state.current_amps = mean_i * n_current;
+    _mean_current = mean_i;
+
+    // Averaged over the packs that actually reported it, not over the whole
+    // set: dividing by the wrong count reports a pack set emptier than it is
+    // and fakes a large spread at the same time.
+    _soc_valid = n_soc > 0;
+    if (_soc_valid) {
+        _soc_pct = uint8_t(constrain_float(mean_soc + 0.5f, 0, 100));
     }
 
     _has_temperature = with_temp > 0;
@@ -419,8 +442,8 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
     }
 
     // consumption from the summed current, integrated once for the set
-    _has_current = with_current > 0;
-    if (_has_current) {
+    if (n_current > 0) {
+        _has_current = true;
         if (_consumed_us != 0) {
             const uint32_t dt_us =
                 ZhiannBMS::consumption_dt_us(now_us - _consumed_us);
@@ -439,15 +462,33 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
 void AP_BattMonitor_ZhiannBMS::read()
 {
     if (_singleton != this) {
-        // a second monitor of this type would publish a duplicate of the same
-        // battery; keep it plainly unhealthy rather than silently wrong
+        // A second monitor of this type would publish a duplicate of the same
+        // battery. Keep it unhealthy rather than silently wrong - but say so,
+        // because ArduPilot's own prearm text is only "Battery N unhealthy"
+        // and an operator upgrading from the old one-instance-per-pack
+        // parameter set has no way to work out what is being complained about.
         _state.healthy = false;
+        const uint32_t now_ms = AP_HAL::millis();
+        if (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000) {
+            _dup_warn_ms = now_ms;
+            char pfx[3] {};
+            if (_state.instance > 0) {
+                hal.util->snprintf(pfx, sizeof(pfx), "%X",
+                                   unsigned(_state.instance + 1));
+            }
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                          "ZhiannBMS: set BATT%s_MONITOR=0, one instance only",
+                          pfx);
+        }
         return;
     }
 
     WITH_SEMAPHORE(_sem);
     const uint32_t now_ms = AP_HAL::millis();
     const uint64_t now_us = AP_HAL::micros64();
+
+    // snapshot for the CAN thread, which decodes current as frames arrive
+    _curr_mult_cached = _curr_mult.get();
 
     // expire alarm telemetry rather than latching it
     if (_alarm_ms != 0 &&
@@ -530,7 +571,7 @@ void AP_BattMonitor_ZhiannBMS::report_inventory(uint32_t now_ms, uint8_t live)
     if (!_inventory_done) {
         _inventory_done = true;
         _expected_packs = live;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: %u pack%s delivering",
+        GCS_SEND_TEXT(MAV_SEVERITY_NOTICE, "ZhiannBMS: %u pack%s delivering",
                       unsigned(live), live == 1 ? "" : "s");
     }
 
@@ -560,16 +601,16 @@ void AP_BattMonitor_ZhiannBMS::report_imbalance(uint32_t now_ms)
     const char *what = nullptr;
     float value = 0;
 
-    if (_sd_voltage > ZHIANN_IMBALANCE_V_SD) {
+    if (_spread_voltage > ZHIANN_IMBALANCE_V_SPREAD) {
         what = "V";
-        value = _sd_voltage;
-    } else if (_sd_soc > ZHIANN_IMBALANCE_SOC_SD) {
+        value = _spread_voltage;
+    } else if (_spread_soc > ZHIANN_IMBALANCE_SOC_SPREAD) {
         what = "SOC";
-        value = _sd_soc;
+        value = _spread_soc;
     } else if (fabsf(_mean_current) > ZHIANN_IMBALANCE_I_FLOOR &&
-               _sd_current > ZHIANN_IMBALANCE_I_SD) {
+               _spread_current > ZHIANN_IMBALANCE_I_SPREAD) {
         what = "A";
-        value = _sd_current;
+        value = _spread_current;
     }
     if (what == nullptr) {
         return;
@@ -578,8 +619,8 @@ void AP_BattMonitor_ZhiannBMS::report_imbalance(uint32_t now_ms)
         return;
     }
     _imbalance_warn_ms = now_ms;
-    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: packs differ, %s sd %.1f",
-                  what, (double)value);
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                  "ZhiannBMS: packs differ by %.1f %s", (double)value, what);
 }
 
 bool AP_BattMonitor_ZhiannBMS::capacity_remaining_pct(uint8_t &percentage) const
@@ -617,8 +658,8 @@ void AP_BattMonitor_ZhiannBMS::log_zbms(uint32_t now_ms, uint8_t live)
     // @Field: Alm: Vendor alarm bitmask, unioned
     // @Field: Warn: Vendor warning bitmask, unioned
     AP::logger().WriteStreaming(
-        "ZBMS", "TimeUS,Np,Dup,Volt,Curr,SOC,Temp,SDV,SDA,SDS,Alm,Warn",
-        "s##vA%OvA---", "F00000000000", "QBBffBffffHH",
+        "ZBMS", "TimeUS,Np,Dup,Volt,Curr,SOC,Temp,DV,DA,DS,SDV,SDA,SDS,Alm,Warn",
+        "s#-vA%OvA-vA---", "F00000000000000", "QBBffBfffffffHH",
         now_us,
         live,
         uint8_t(_dup_any ? 1 : 0),
@@ -626,6 +667,9 @@ void AP_BattMonitor_ZhiannBMS::log_zbms(uint32_t now_ms, uint8_t live)
         (double)_state.current_amps,
         _soc_pct,
         (double)_state.temperature,
+        (double)_spread_voltage,
+        (double)_spread_current,
+        (double)_spread_soc,
         (double)_sd_voltage,
         (double)_sd_current,
         (double)_sd_soc,
@@ -648,10 +692,11 @@ void AP_BattMonitor_ZhiannBMS::log_zbms(uint32_t now_ms, uint8_t live)
             continue;
         }
         AP::logger().WriteStreaming(
-            "ZBND", "TimeUS,Node,Volt,Curr,SOC,Temp,Dup,ID",
-            "s#vA%O#-", "F0000000", "QBffBfBI",
+            "ZBND", "TimeUS,Node,Ctb,Volt,Curr,SOC,Temp,Dup,ID",
+            "s#-vA%O#-", "F00000000", "QBBffBfBI",
             now_us,
             node,
+            uint8_t(n.contributing ? 1 : 0),
             (double)n.voltage,
             (double)n.current,
             uint8_t(n.soc_tenths / 10),

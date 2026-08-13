@@ -472,36 +472,51 @@ TEST(ZhiannDecode, soc_cadence_tolerates_dropped_frames)
     EXPECT_TRUE(d.active(t));
 }
 
-TEST(ZhiannDecode, stdev_of_pack_spread)
+TEST(ZhiannDecode, reduce_pack_spread)
 {
-    // no spread to speak of: a single pack, and identical packs
-    EXPECT_FLOAT_EQ(stdev(102.5f, 102.5f * 102.5f, 1), 0.0f);
-    float sum = 0, sum_sq = 0;
-    for (uint8_t i = 0; i < 4; i++) {
-        sum += 100.0f;
-        sum_sq += 100.0f * 100.0f;
-    }
-    // identical values: the variance subtraction must not go negative and
-    // produce a NaN through sqrtf
-    EXPECT_FLOAT_EQ(stdev(sum, sum_sq, 4), 0.0f);
+    float mean, spread, sd;
+
+    // one pack: nothing to compare against
+    const float one[] = { 102.5f };
+    reduce(one, 1, mean, spread, sd);
+    EXPECT_FLOAT_EQ(mean, 102.5f);
+    EXPECT_FLOAT_EQ(spread, 0.0f);
+    EXPECT_FLOAT_EQ(sd, 0.0f);
+
+    // identical packs: must not produce a NaN through a negative variance
+    const float same[] = { 100.0f, 100.0f, 100.0f, 100.0f };
+    reduce(same, 4, mean, spread, sd);
+    EXPECT_FLOAT_EQ(spread, 0.0f);
+    EXPECT_FLOAT_EQ(sd, 0.0f);
 
     // the four packs measured on the bench 2026-08-14
-    const float v[] = { 102.09f, 102.38f, 102.58f, 102.93f };
-    sum = 0; sum_sq = 0;
-    for (uint8_t i = 0; i < 4; i++) {
-        sum += v[i];
-        sum_sq += v[i] * v[i];
-    }
-    EXPECT_NEAR(stdev(sum, sum_sq, 4), 0.303f, 0.005f);
+    const float bench[] = { 102.09f, 102.38f, 102.58f, 102.93f };
+    reduce(bench, 4, mean, spread, sd);
+    EXPECT_NEAR(mean, 102.495f, 0.001f);
+    EXPECT_NEAR(spread, 0.84f, 0.001f);
+    EXPECT_NEAR(sd, 0.3057f, 0.0005f);
 
-    // one pack collapsed: the spread is what the operator needs to see
-    const float bad[] = { 102.09f, 102.38f, 102.58f, 88.0f };
-    sum = 0; sum_sq = 0;
-    for (uint8_t i = 0; i < 4; i++) {
-        sum += bad[i];
-        sum_sq += bad[i] * bad[i];
-    }
-    EXPECT_GT(stdev(sum, sum_sq, 4), 6.0f);
+    // A tight spread must survive the ~102V common mode. The single-pass
+    // sum_sq/n - mean^2 form reported 0.025V here against a true 0.004V.
+    const float tight[] = { 102.00f, 102.00f, 102.01f, 102.01f };
+    reduce(tight, 4, mean, spread, sd);
+    EXPECT_NEAR(spread, 0.01f, 0.002f);
+    EXPECT_NEAR(sd, 0.005f, 0.002f);
+
+    // one pack open-circuit, sitting above the loaded bus: the case the
+    // warning exists for, and the one a standard-deviation threshold missed
+    const float open_fet[] = { 100.0f, 100.0f, 100.0f, 101.6f };
+    reduce(open_fet, 4, mean, spread, sd);
+    EXPECT_NEAR(spread, 1.6f, 0.001f);
+    EXPECT_LT(sd, 0.7f);        // sd would not have reached a 1.5V threshold
+
+    // spread is independent of pack count for the same physical fault;
+    // standard deviation is not
+    const float two[] = { 100.0f, 101.6f };
+    float mean2, spread2, sd2;
+    reduce(two, 2, mean2, spread2, sd2);
+    EXPECT_NEAR(spread2, spread, 0.001f);
+    EXPECT_GT(sd2, sd);
 }
 
 AP_GTEST_MAIN()

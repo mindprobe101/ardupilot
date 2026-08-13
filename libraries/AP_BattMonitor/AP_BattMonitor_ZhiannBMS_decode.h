@@ -342,21 +342,51 @@ inline bool fresh_ms(uint32_t now_ms, uint32_t sample_ms, uint32_t timeout_ms)
     return sample_ms != 0 && (now_ms - sample_ms) <= timeout_ms;
 }
 
-// Population standard deviation from a running sum and sum of squares, used
-// to report how far apart the parallel packs are. Zero for a single sample.
-// The subtraction can go slightly negative through rounding when every value
-// is identical, so the variance is floored before the square root.
-inline float stdev(float sum, float sum_sq, uint8_t n)
+// Reduce a set of per-pack readings to mean, spread (max - min) and
+// population standard deviation, in two passes.
+//
+// Two passes, not the running sum-of-squares form, because the packs sit at
+// ~102V with a spread measured in tenths of a volt: in float32 the
+// sum_sq/n - mean^2 subtraction cancels almost everything and the error is
+// roughly constant in variance, so a true 0.004V spread reads 0.025V. That is
+// harmless at a warning threshold but makes the logged value useless for
+// judging how closely the packs actually track each other.
+//
+// Spread is what the imbalance warning uses. Standard deviation shrinks as
+// packs are added - one pack D volts away from n-1 others gives D*sqrt(n-1)/n,
+// so the same physical fault reads 0.50D on two packs and 0.40D on five -
+// which makes a fixed threshold mean different things on different flights.
+// Spread is simply "how far apart the extremes are", independent of count.
+inline void reduce(const float *values, uint8_t n, float &mean, float &spread,
+                   float &sd)
 {
+    mean = 0;
+    spread = 0;
+    sd = 0;
+    if (n == 0) {
+        return;
+    }
+    float sum = 0, lo = values[0], hi = values[0];
+    for (uint8_t k = 0; k < n; k++) {
+        sum += values[k];
+        if (values[k] < lo) {
+            lo = values[k];
+        }
+        if (values[k] > hi) {
+            hi = values[k];
+        }
+    }
+    mean = sum / n;
+    spread = hi - lo;
     if (n < 2) {
-        return 0;
+        return;
     }
-    const float mean = sum / n;
-    float variance = sum_sq / n - mean * mean;
-    if (variance < 0) {
-        variance = 0;
+    float ss = 0;
+    for (uint8_t k = 0; k < n; k++) {
+        const float d = values[k] - mean;
+        ss += d * d;
     }
-    return sqrtf(variance);
+    sd = sqrtf(ss / n);
 }
 
 inline uint32_t consumption_dt_us(uint64_t elapsed_us)

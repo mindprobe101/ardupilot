@@ -64,12 +64,12 @@ private:
         ZhiannBMS::CellAccumulator accumulator;
         ZhiannBMS::SocCadenceDupDetector dup;
         ZhiannBMS::IdentityDupDetector identity;
-        bool     seen;           // ever heard from, this boot
+        bool     contributing;   // included in the aggregate this cycle
     };
 
     // decode one frame and file it against its node (CAN driver thread)
     bool dispatch_frame(AP_HAL::CANFrame &frame);
-    void handle_frame(Node &n, uint8_t node_num, uint8_t frame_type,
+    void handle_frame(Node &n, uint8_t frame_type,
                       const AP_HAL::CANFrame &frame);
 
     // aggregate every fresh node into _state; returns packs contributing
@@ -101,11 +101,16 @@ private:
     // consumption is integrated once, from the summed pack current
     uint64_t _consumed_us = 0;
 
-    // spread across the packs, recomputed each read()
+    // how far apart the packs are, recomputed each read(). The warning keys
+    // off spread (max - min); the standard deviations are logged alongside.
     float _sd_voltage = 0;
     float _sd_current = 0;
     float _sd_soc = 0;
+    float _spread_voltage = 0;
+    float _spread_current = 0;
+    float _spread_soc = 0;
     float _mean_current = 0;
+    float _curr_mult_cached = 1.0f;  // snapshot for the CAN thread
 
     // operator messaging state
     uint32_t _bus_settle_ms = 0;    // last time a new node appeared

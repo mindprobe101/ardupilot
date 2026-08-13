@@ -53,12 +53,18 @@ ZhiannBMS: packs differ, V sd 2.3    (the packs stopped agreeing)
 ```
 
 The last one is the check that averaging would otherwise hide: a mean says
-nothing about whether one pack has collapsed. The driver measures the standard
-deviation of pack voltage, current and state of charge across the set and warns
-when it stops looking normal. Four packs on the bench measured
-102.09/102.38/102.58/102.93 V — a standard deviation of 0.31 V — so the
-thresholds (1.5 V, 8 %, 20 A) sit well clear of healthy spread. Current is only
-judged once the set is delivering more than 20 A, because sharing at idle is
+nothing about whether one pack has collapsed. The driver measures the **spread**
+(highest minus lowest) of pack voltage, current and state of charge and warns
+when it stops looking normal — thresholds 1.0 V, 15 %, 30 A.
+
+Spread, not standard deviation: standard deviation shrinks as packs are added,
+so the same physical fault would read 0.50x its size on two packs and 0.40x on
+five, and a fixed threshold would mean different things on different flights.
+The realistic failure — a pack whose contactor has opened, sitting at its
+unloaded voltage roughly 1.5 V above the loaded bus — is caught at 1.0 V spread
+but would not have reached any sane standard-deviation threshold. Four packs at
+rest measured a spread of 0.84 V, so the margin is deliberately narrow. Current
+is judged only once the set is delivering, because sharing at idle is
 meaningless and the BMS reports exactly 0 A below a few amps.
 
 Health is simple: the battery is healthy while **at least one pack** is
