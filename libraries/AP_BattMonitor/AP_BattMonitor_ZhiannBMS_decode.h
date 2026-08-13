@@ -507,6 +507,10 @@ public:
     // frame). The packs that joined 2s later onto an already-busy bus showed
     // clean 508ms cadence from their first frame and never tripped.
     //
+    // This is the NORMAL case on this aircraft, not an edge case: the Cube
+    // runs on a separate avionics battery, so it is already on the bus when
+    // the packs are switched on, and it therefore sees every pack's storm.
+    //
     // DO NOT RAISE THIS FLOOR. Two packs on one node do not interleave evenly
     // at ~254ms; they hold a locked, small phase offset and alternate a short
     // gap with a long one. Measured over the corpus, the short gaps have

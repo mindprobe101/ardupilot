@@ -234,9 +234,14 @@ Membership is expressed by *which node slots the FC polls*, fixed at
 enumeration: after a cold boot with only node 1 present it polls only `…5839`;
 if a pack is hot-unplugged it keeps polling the empty node until the next boot.
 
-**The FC is powered from the packs**, so its first frame always arrives
+**The V10Pro is powered from the packs**, so its first frame always arrives
 1.6-17 s after the packs start transmitting. It cannot be present when a pack
 chooses its node — it can only react afterwards.
+
+This does **not** apply to the ArduPilot aircraft, which runs a separate
+avionics battery: the Cube is normally on the bus *before* the packs. That
+reverses the ordering above, and it is why the retransmit storm below is the
+normal case there rather than an edge case.
 
 Bus behaviour worth knowing: a pack transmitting with nothing else on the bus
 retransmits each frame ~13x at ~4 ms spacing until something ACKs (seen at
