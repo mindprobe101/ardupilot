@@ -37,7 +37,9 @@ this file is the operational knowledge.
 ## 2. Node claims — the central problem
 
 - Each pack broadcasts on a node index (0..15 possible; 0-4 seen) that
-  prefixes all its IDs. ArduPilot maps `BATTn_SERIAL_NUM` to this node.
+  prefixes all its IDs. The ArduPilot driver consumes every node it finds and
+  averages them into one battery, so the index is a diagnostic label rather
+  than something to configure.
 - **Each pack has a preferred node.** It takes that node when free and falls
   back to another when it is occupied. Fallbacks are remembered, so the same
   pack set tends to reproduce the same allocation on every boot.
@@ -64,9 +66,12 @@ this file is the operational knowledge.
 - **Unexplained:** on 2026-08-14 a pack claimed node 2 a full **26 s** after
   another pack was established and broadcasting there. A simultaneous-claim
   race does not account for that, and no mechanism is yet known.
-- **Always verify the node map before arming.** This is the only dependable
-  step: confirm the expected number of distinct battery instances appears. If
-  one is missing or flagged duplicate, power fully down and repeat.
+- **Verify the pack count before arming.** The ArduPilot driver announces
+  `ZhiannBMS: N packs delivering` once the bus settles; check it against the
+  packs you loaded. Since 2026-08-14 a collision no longer blocks the flight -
+  the whole set is published as one battery, so a shared node just means the
+  count reads one low, and the driver says so. Power fully down and repeat if
+  you want the count to match.
 - The permanent fix is distinct stored nodes per pack, reachable only through
   the ZhianLink USB-C tool, not over CAN. This is the outstanding vendor ask,
   along with whether firmware after 2.01.0003 implements the UID-rank
@@ -129,13 +134,13 @@ cannot be relied on to detect a collision — only to name one already found.
 - **Before every session/flight: check for node overlap.** Options:
   - live dashboard: `bms_dashboard.py` → http://localhost:8787 (red row
     = multiple packs on one node), logs simultaneously;
-  - the Cube itself: GCS warning "ZhiannBMS: duplicate pack on node N"
-    plus that instance held unhealthy (arming blocked while a collision
-    or a missing pack exists — the system fails safe).
-- Mission profiles: `zhiann-bms/params-4pack.param` / `params-2pack.param`
-  (auto-bind serials -1; 2-pack profile disables BATT3/4). With auto-bind
-  the BATTn↔pack mapping follows first-heard order and may swap between
-  boots; pin serials only when per-pack identity matters.
+  - the Cube itself: `ZhiannBMS: N packs delivering` at startup and
+    `ZhiannBMS: a node carries 2 packs, count reads low` when a collision is
+    detected. Neither blocks arming: the packs are averaged into one battery
+    and a collision is absorbed by the aggregate.
+- Mission profile: `zhiann-bms/params.param`, the same file for any pack
+  count. Per-pack readings stay visible in the ZBND/ZBC1/ZBC2 dataflash
+  messages even though ArduPilot sees one battery.
 - Cell display: MAVLink carries only 14 of 24 cells; the shown per-cell
   voltages are redistributed so their sum equals pack voltage (~7.19 V
   each at 100.7 V) — relative differences remain meaningful. True cells
@@ -187,16 +192,18 @@ cannot be relied on to detect a collision — only to name one already found.
 
 ## 6. ArduPilot driver capabilities (branch Copter-4.6.3-zhiann-bms)
 
-Voltage, current, consumed mAh/Wh initialized from BMS SOC and then kept at
-the conservative maximum of the SOC-derived floor and current integration,
-24 cells (14 live via MAVLink, all 24 in dataflash), both temps (max
-reported), and fresh BMS SOC. The safety path requires five clean PACK
-intervals plus a fresh atomic 24-cell snapshot; it checks PACK against both
-the cell sum and SOC voltage mirror, rejects implausible values, maps alarm
-faults, detects duplicate nodes/standby/unmapped packs, and is RX-only.
-Multi-pack via
-BATTn_SERIAL_NUM = node or -1 auto-bind, up to node 15 / 9 instances.
-`BATTn_SERIAL_NUM` is snapshotted at initialization; reboot after changing it.
+The whole pack set is published as ONE battery: mean voltage, summed current,
+mean SOC, highest temperature, mean cell voltages. Every node on the bus is
+consumed, so there is no node-to-instance mapping and nothing a collision or a
+changed pack count can break. Cell sets are still assembled atomically per
+pack, implausible values rejected, and alarm frames mapped to MAVLink faults.
+The driver is RX-only.
+
+Because a mean hides a single failing pack, the driver measures the standard
+deviation of pack voltage, current and SOC across the set and warns when it
+exceeds its threshold. Per-pack readings are logged (ZBND, ZBC1/ZBC2) so the
+offender can be identified afterwards. Health is simply: at least one pack
+delivering complete, fresh data.
 
 ## 7. Vendor situation
 

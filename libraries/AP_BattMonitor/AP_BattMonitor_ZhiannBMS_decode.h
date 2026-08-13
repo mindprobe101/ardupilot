@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <math.h>   // sqrtf, for the pack-spread standard deviation
 
 namespace ZhiannBMS {
 
@@ -336,19 +337,26 @@ inline uint8_t soc_coarse_pct(const uint8_t *d)
 inline bool soc_coarse_valid(const uint8_t *d) { return (d[0] & 0x7F) <= 100; }
 inline uint16_t soc_voltage_mirror(const uint8_t *d) { return u16(&d[2]); }
 
-inline bool pack_vmir_coherent(float pack_voltage, uint16_t mirror_raw,
-                               float tolerance_v)
-{
-    float difference_v = mirror_raw / 320.0f - pack_voltage;
-    if (difference_v < 0) {
-        difference_v = -difference_v;
-    }
-    return difference_v <= tolerance_v;
-}
-
 inline bool fresh_ms(uint32_t now_ms, uint32_t sample_ms, uint32_t timeout_ms)
 {
     return sample_ms != 0 && (now_ms - sample_ms) <= timeout_ms;
+}
+
+// Population standard deviation from a running sum and sum of squares, used
+// to report how far apart the parallel packs are. Zero for a single sample.
+// The subtraction can go slightly negative through rounding when every value
+// is identical, so the variance is floored before the square root.
+inline float stdev(float sum, float sum_sq, uint8_t n)
+{
+    if (n < 2) {
+        return 0;
+    }
+    const float mean = sum / n;
+    float variance = sum_sq / n - mean * mean;
+    if (variance < 0) {
+        variance = 0;
+    }
+    return sqrtf(variance);
 }
 
 inline uint32_t consumption_dt_us(uint64_t elapsed_us)
@@ -356,22 +364,6 @@ inline uint32_t consumption_dt_us(uint64_t elapsed_us)
     // update_consumed() rejects values >=2 seconds. Saturating prevents a
     // multi-hour outage from folding through uint32_t and looking recent.
     return elapsed_us > UINT32_MAX ? UINT32_MAX : uint32_t(elapsed_us);
-}
-
-inline float consumed_mah_from_soc(float capacity_mah, uint16_t soc_tenths)
-{
-    const float bounded_soc = soc_tenths > 1000 ? 1000.0f : float(soc_tenths);
-    return capacity_mah * (1000.0f - bounded_soc) * 0.001f;
-}
-
-inline float reconciled_consumed_mah(float integrated_mah, float capacity_mah,
-                                     uint16_t soc_tenths)
-{
-    // Monotonic floor: SOC-derived consumption may raise the integrated
-    // total but never lower it, including when the integrator re-seeds
-    // after a session reset.
-    const float soc_mah = consumed_mah_from_soc(capacity_mah, soc_tenths);
-    return soc_mah > integrated_mah ? soc_mah : integrated_mah;
 }
 
 // choose the hotter of the plausible sensors; false when both are implausible
@@ -389,23 +381,6 @@ inline bool select_temperature(float t1, float t2, float &out)
         return false;
     }
     return true;
-}
-
-inline bool pack_cells_coherent(float pack_voltage, const uint16_t *cells,
-                                uint8_t cell_count, float tolerance_v)
-{
-    uint32_t sum_mv = 0;
-    for (uint8_t i = 0; i < cell_count; i++) {
-        if (cells[i] < 500 || cells[i] > 6000) {
-            return false;
-        }
-        sum_mv += cells[i];
-    }
-    float difference_v = sum_mv * 0.001f - pack_voltage;
-    if (difference_v < 0) {
-        difference_v = -difference_v;
-    }
-    return difference_v <= tolerance_v;
 }
 
 // cell-voltage frame map: frame type -> first cell index (0-based),
@@ -491,123 +466,6 @@ private:
     uint16_t _cell_count = 0;
     uint8_t _slice_mask = 0;
     uint8_t _next_slice = 0;
-};
-
-// duplicate-node detector: a lone pack sends PACK_VOLT every ~500ms, so
-// sustained sub-300ms arrivals mean two packs share the node. Hysteresis
-// keeps a single glitch from flapping the state
-class DupDetector {
-public:
-    // Same retransmit/queue-drain floor as SocCadenceDupDetector, and for the
-    // same reason. Without it the first pack to appear on a quiet bus emits a
-    // startup burst of PACK_VOLT frames whose sub-millisecond spacing scores
-    // as an impossibly fast cadence: observed on the bench 2026-08-14, where
-    // the first of four packs tripped a false duplicate on node 0 within one
-    // second and held it 9.5s (decay here is one point per ~508ms detail
-    // frame). The packs that joined 2s later onto an already-busy bus showed
-    // clean 508ms cadence from their first frame and never tripped.
-    //
-    // This is the NORMAL case on this aircraft, not an edge case: the Cube
-    // runs on a separate avionics battery, so it is already on the bus when
-    // the packs are switched on, and it therefore sees every pack's storm.
-    //
-    // DO NOT RAISE THIS FLOOR. Two packs on one node do not interleave evenly
-    // at ~254ms; they hold a locked, small phase offset and alternate a short
-    // gap with a long one. Measured over the corpus, the short gaps have
-    // median 40ms and minimum 36ms, so 20ms sits only 16ms below the real
-    // collision signature. Replay confirms it: at 20ms the floor removes 5 of
-    // the 6 single-pack false positives (~10s each) while all three genuine
-    // collisions are still detected to within 0.5s of their full duration.
-    //
-    // The sixth is a pack handover on an occupied node, where the data really
-    // is a mixture while it happens; raising the activation threshold to 16
-    // does not remove it, so it is left to the settling window to keep quiet.
-    static const uint32_t MIN_GAP_MS = 20;
-
-    void feed(uint32_t now_ms)
-    {
-        if (_last_ms != 0) {
-            const uint32_t dt = now_ms - _last_ms;
-            if (dt >= 400 && dt <= 750) {
-                if (_clean_intervals < 5) {
-                    _clean_intervals++;
-                }
-            } else if (dt > 750 && dt <= 1800) {
-                // up to ~3 lost ~500ms frames: neither collision evidence
-                // nor a clean interval, so hold qualification progress.
-                // Long gaps are never a collision signature; resetting on
-                // them only makes qualification flap during dropouts
-            } else {
-                _clean_intervals = 0;
-            }
-            if (dt >= MIN_GAP_MS && dt < 300) {
-                _score = _score >= 18 ? 20 : _score + 2;
-            } else if (dt >= 400 && _score > 0) {
-                _score--;
-            }
-        }
-        _last_ms = now_ms;
-    }
-    bool active()
-    {
-        if (!_active && _score >= 10) {
-            _active = true;
-        } else if (_active && _score <= 3) {
-            _active = false;
-        }
-        return _active;
-    }
-    bool qualified() const { return _clean_intervals >= 5; }
-    void reset_qualification() { _clean_intervals = 0; }
-private:
-    uint32_t _last_ms = 0;
-    uint8_t _score = 0;
-    uint8_t _clean_intervals = 0;
-    bool _active = false;
-};
-
-// Two consecutive mismatches from the same evidence stream (SOC voltage
-// mirror or cell-sum) are strong collision evidence and activate the fault;
-// a lone mismatch (bus glitch, boundary sample) only arms that stream's
-// pending strike, which the stream's next clean check clears. The streams
-// keep separate strikes: one physical transient hitting both checks once
-// each within a burst must not activate. Once active, require a run of
-// clean independent checks before clearing so alternating mixed and coherent
-// frames cannot make health flicker during cadence-detector warm-up.
-class CoherenceDetector {
-public:
-    void feed_vmir(bool coherent) { feed(_pending_vmir, coherent); }
-    void feed_cellsum(bool coherent) { feed(_pending_cellsum, coherent); }
-    bool active() const { return _score > 0; }
-
-    // session boundary (>5s outage): a half-armed strike must not pair
-    // with the new session's first mismatch, while an accumulated active
-    // score is deliberately preserved as evidence
-    void clear_pending()
-    {
-        _pending_vmir = false;
-        _pending_cellsum = false;
-    }
-
-private:
-    void feed(bool &pending, bool coherent)
-    {
-        if (!coherent) {
-            if (pending) {
-                _score = 20;
-            }
-            pending = true;
-        } else {
-            pending = false;
-            if (_score > 0) {
-                _score--;
-            }
-        }
-    }
-
-    uint8_t _score = 0;
-    bool _pending_vmir = false;
-    bool _pending_cellsum = false;
 };
 
 }  // namespace ZhiannBMS

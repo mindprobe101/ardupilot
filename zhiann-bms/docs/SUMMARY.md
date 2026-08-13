@@ -12,17 +12,19 @@ CubeOrange+ running ArduCopter 4.6.3, on branch `Copter-4.6.3-zhiann-bms`.
   consumed mAh/Wh, all 24 cell voltages
   (14 live via MAVLink, 24 in dataflash), dual temperatures, healthy-state
   BMS SOC, alarm-frame fault mapping, and operator
-  diagnostics: qualified-session duplicate-node detection, atomic cell
-  snapshots, cell-sum/SOC-mirror coherence, standby detection,
-  fail-safe unmapped-node handling, per-node fleet inventory. Multi-pack via `BATTn_SERIAL_NUM`
-  (node number, or -1 auto-bind); nodes 0-15, up to 9 instances.
+  diagnostics: pack inventory, duplicate-node detection, atomic cell
+  snapshots and a pack-spread (standard deviation) imbalance warning.
+  The whole pack set is published as ONE battery - every node on the bus is
+  consumed and reduced to mean voltage, summed current, mean SOC and highest
+  temperature - so node collisions and changing pack counts need no
+  reconfiguration. Configure exactly one instance.
 - **Pure decode core** (`AP_BattMonitor_ZhiannBMS_decode.h`) shared with
-  a gtest replay suite (`tests/test_zhiann_decode.cpp`, 21 cases combining
+  a gtest replay suite (`tests/test_zhiann_decode.cpp`, 30 cases combining
   real captured frames with explicit synthetic boundary cases) -
   `./waf configure --board sitl` then build
   target `tests/test_zhiann_decode`.
 - **Ops assets** (this folder): build instructions and
-  2-pack/4-pack mapping templates, PROTOCOL.md / LOGGING.md / LEARNINGS.md,
+  a single parameter template, PROTOCOL.md / LOGGING.md / LEARNINGS.md,
   and a software-versus-bench VALIDATION.md report.
 - **Bench tooling** (developer machine, `~/can_bms`): NUCLEO-H753ZI
   sniffer firmware (auto-bitrate RX + command-driven TX), live web

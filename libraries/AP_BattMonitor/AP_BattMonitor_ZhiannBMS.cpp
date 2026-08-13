@@ -4,13 +4,11 @@
   protocol reverse engineered from live packs (2026-07): 1 Mbit/s classic
   CAN, all IDs 29-bit extended, values little-endian u16 unless noted.
 
-  Multiple packs share one bus. Pack n transmits the ID block
-  0x2E0941 + 0x20*n plus an SOC frame at 0x401A100 + n (4 packs observed
-  live; the ID arithmetic is extrapolated up to node 15, the SOC frame's
-  node nibble - ArduPilot itself supports 9 monitors). Node numbering
-  is a firmware claim that can migrate or collide. Frame types within a
-  pack block (offset
-  from 0x...41):
+  Several packs share one bus, wired in parallel. Pack n transmits the ID
+  block 0x2E0941 + 0x20*n plus an SOC frame at 0x401A100 + n. The node
+  number is a claim the pack firmware makes for itself: it can migrate, and
+  two packs can end up claiming the same one. Frame types within a pack
+  block (offset from 0x...41):
 
     +0x00  cell voltages 19..22 (mV)
     +0x01  temperature1 (0.1 C), temperature2 (0.1 C), SOC (0.1 %)
@@ -24,21 +22,23 @@
            negative = discharge, reads 0 below a few amps)
 
   0x401A100+n: SOC (%), pack voltage mirror (1/320 V), temperature?
-    Emitted by every pack on its own node; its cadence doubles when two
-    packs share a node, which is the primary duplicate-node signal.
   0x402A100+n: 2 s frame carrying a per-pack identity in bytes 4..7. Not
-    every occupied node emits it and the rule is not known, so it can name
-    the packs involved in a collision but cannot detect one on its own.
+    every occupied node emits it and the rule is not known.
 
   The pack block repeats every ~500 ms. Current is 1 mA/LSB: the pack
   broadcasts its own 44.0 Ah rated capacity, and coulomb-counting flights
   against the packs' own SOC agrees with that scale. Use BATTn_CURR_MULT to
   trim in the field.
 
-  Instance selection: set BATTn_SERIAL_NUM to the pack node (0..15), or
-  leave -1 to bind to the first pack not claimed by any other instance.
-  Auto-binding is resolved in BATTn instance order, independent of CAN
-  callback registration order.
+  THE PACK SET IS PUBLISHED AS ONE BATTERY. Every node found on the bus is
+  consumed and reduced to a single reading: mean voltage, summed current,
+  mean SOC, highest temperature, mean cell voltages. There is no node-to-
+  instance mapping and therefore nothing for a node collision to break - a
+  collision simply means one less node carrying two packs' frames, and the
+  averages absorb it. The node count and any suspected collision are
+  reported to the operator as information, never as a health failure.
+
+  Configure exactly one battery monitor with this type.
 
   Limitations:
    - one bus only: CANSensor supports one CAN interface. Configure this
@@ -50,7 +50,6 @@
 
 #include <AP_BoardConfig/AP_BoardConfig.h>
 #include <AP_HAL/AP_HAL.h>
-#include <AP_HAL/utility/sparse-endian.h>
 #include <AP_Logger/AP_Logger.h>
 #include <GCS_MAVLink/GCS.h>
 
@@ -99,34 +98,31 @@ static const struct {
     { ZHIANN_ALARM_DIS_OVERCURRENT, "dis OC" },
 };
 
-// consider the BMS gone after the codebase-wide battery timeout
-#define ZHIANN_TIMEOUT_US      (AP_BATT_MONITOR_TIMEOUT * 1000ULL)
+// a pack is part of the set while its frames are this fresh
+#define ZHIANN_NODE_TIMEOUT_MS  AP_BATT_MONITOR_TIMEOUT
 
 // accept the coarse 1% SOC only when the fine 0.1% frame (nominally
 // every 500ms) has been silent this long
 #define ZHIANN_FINE_SOC_STALE_MS  2500
 
-// Clean captures stayed below this full-cell-sum mismatch; every mismatch
-// above 1V in the corpus came from a known duplicate-node collision.
-#define ZHIANN_CELL_SUM_TOLERANCE_V  1.0f
+// Across 35,613 complete captured bursts, all seven slices span 22..55ms.
+#define ZHIANN_CELL_SNAPSHOT_SPAN_MS  250
 
-// Longest a coherence fault alone may hold health down. Must stay clear of
-// AP_BATT_MONITOR_TIMEOUT (5s), after which ArduPilot raises a battery
-// failsafe that latches for the remainder of the flight.
-#define ZHIANN_COHERENCE_HOLD_MS  3000
-
-// Packs do not power on together: on the bench 2026-08-14 four packs switched
-// on by one operator action appeared over 2.5s. Until the last one has
-// claimed, the bus is a half-formed fleet, so collision and instance-count
-// warnings describe a state that is about to stop being true. Hold those
-// MESSAGES until no new node has appeared for this long. Health gating is
-// deliberately NOT delayed - arming stays blocked throughout.
+// Packs do not power on together: four packs switched on by one operator
+// action appeared over 2.5s on the bench. Wait for the set to stop growing
+// before announcing how many were found.
 #define ZHIANN_BUS_SETTLE_MS  5000
 
-// Across 35,613 complete captured bursts, all seven slices span 22..55ms.
-// This margin tolerates bus/scheduler jitter but rejects a set assembled
-// from different nominal 500ms generations after a slice is lost.
-#define ZHIANN_CELL_SNAPSHOT_SPAN_MS  250
+// Imbalance reporting. The packs sit in parallel, so at rest they track each
+// other closely: four packs measured 102.09/102.38/102.58/102.93 V, a
+// standard deviation of 0.31 V. These thresholds sit well clear of that so
+// they mean something when they fire. Current is only judged once the set is
+// actually delivering, because sharing at idle is meaningless and the BMS
+// reports exactly 0 A below a few amps.
+#define ZHIANN_IMBALANCE_V_SD     1.5f    // volts
+#define ZHIANN_IMBALANCE_SOC_SD   8.0f    // percent
+#define ZHIANN_IMBALANCE_I_SD     20.0f   // amps
+#define ZHIANN_IMBALANCE_I_FLOOR  20.0f   // total amps before current is judged
 
 const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 
@@ -164,12 +160,7 @@ private:
 };
 
 AP_BattMonitor_ZhiannBMS_CAN *AP_BattMonitor_ZhiannBMS::_can_driver;
-AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_instances[AP_BATT_MONITOR_MAX_INSTANCES];
-uint8_t AP_BattMonitor_ZhiannBMS::_num_instances;
-uint16_t AP_BattMonitor_ZhiannBMS::_nodes_announced;
-uint32_t AP_BattMonitor_ZhiannBMS::_bus_settle_ms;
-uint32_t AP_BattMonitor_ZhiannBMS::_unmapped_warn_ms[ZhiannBMS::MAX_NODE + 1];
-bool AP_BattMonitor_ZhiannBMS::_misconfig_checked;
+AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_singleton;
 
 AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
         AP_BattMonitor::BattMonitor_State &mon_state,
@@ -180,19 +171,18 @@ AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
     _state.var_info = var_info;
 
     // cells not yet received report as not-present
-    memset(_interim_state.cell_voltages.cells, 0xFF,
-           sizeof(_interim_state.cell_voltages.cells));
-    memset(_cells24, 0xFF, sizeof(_cells24));
+    memset(_state.cell_voltages.cells, 0xFF, sizeof(_state.cell_voltages.cells));
+    for (uint8_t i = 0; i < ARRAY_SIZE(_nodes); i++) {
+        memset(_nodes[i].cells, 0xFF, sizeof(_nodes[i].cells));
+    }
 
-    // starts with not healthy
     _state.healthy = false;
 
-    // register in the shared dispatch table; instances are created in
-    // BATTn order by the front-end, which fixes the auto-bind priority
-    if (_num_instances < ARRAY_SIZE(_instances)) {
-        _instances[_num_instances++] = this;
-    }
-    if (_can_driver == nullptr) {
+    // The whole pack set is one battery, so only the first instance of this
+    // type does anything. A second one would decode the same frames twice and
+    // publish a duplicate of the same battery.
+    if (_singleton == nullptr) {
+        _singleton = this;
         _can_driver = NEW_NOTHROW AP_BattMonitor_ZhiannBMS_CAN(*this);
         if (_can_driver == nullptr) {
             AP_BoardConfig::allocation_error("ZhiannBMS CAN driver");
@@ -200,904 +190,531 @@ AP_BattMonitor_ZhiannBMS::AP_BattMonitor_ZhiannBMS(AP_BattMonitor &mon,
     }
 }
 
-void AP_BattMonitor_ZhiannBMS::init()
-{
-    const int32_t serial = _params._serial_number.get();
-    if (serial == -1) {
-        _configured_node = -1;
-    } else if (serial >= 0 && serial <= ZhiannBMS::MAX_NODE) {
-        _configured_node = int8_t(serial);
-    } else {
-        _configured_node = -2;
-    }
-}
-
-bool AP_BattMonitor_ZhiannBMS::matches_node(uint8_t node) const
-{
-    if (_configured_node >= 0) {
-        return node == uint8_t(_configured_node);
-    }
-    return _configured_node == -1 && _auto_node >= 0 &&
-           node == uint8_t(_auto_node);
-}
-
-bool AP_BattMonitor_ZhiannBMS::node_claimed(uint8_t node)
-{
-    for (uint8_t i = 0; i < _num_instances; i++) {
-        if (_instances[i]->_configured_node == int8_t(node)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// dedicated CAN-driver callback, dispatching across all battery instances
+// Decode one frame and file it against its node. Runs on the CAN driver
+// thread. Every node is accepted: there is no mapping to get wrong.
 bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
 {
     if (!frame.isExtended() || frame.isRemoteTransmissionRequest() ||
-        frame.isErrorFrame() || frame.isCanFDFrame()) {
+        frame.isErrorFrame()) {
         return false;
     }
-    const uint32_t id = frame.id & AP_HAL::CANFrame::MaskExtID;
 
     ZhiannBMS::Classified cls;
-    if (!ZhiannBMS::classify(id, cls)) {
+    if (!ZhiannBMS::classify(frame.id & AP_HAL::CANFrame::MaskExtID, cls)) {
         return false;
     }
     if (!ZhiannBMS::valid_dlc(cls.type, frame.dlc)) {
         return false;
     }
 
-    // BMS alarm frame (PF 0x24, spec 6.8): never observed on the healthy
-    // bench bus. Its SA is a standard protocol address, not the proprietary
-    // broadcast node, and unassigned packs all use SA=0. Without a verified
-    // identity mapping, conservatively deliver every alarm to every pack.
+    WITH_SEMAPHORE(_sem);
+    const uint32_t now_ms = AP_HAL::millis();
+
+    // The alarm frame is anonymous: it carries no node, and applies to the
+    // set. Union the bits; they are reported, and never gate health.
     if (cls.type == ZhiannBMS::FRAME_ALARM) {
-        for (uint8_t i = 0; i < _num_instances; i++) {
-            _instances[i]->handle_pack_frame(ZhiannBMS::FRAME_ALARM, frame);
+        const uint16_t alarm = ZhiannBMS::u16(&frame.data[0]);
+        const uint16_t warning = ZhiannBMS::u16(&frame.data[2]);
+        if (!ZhiannBMS::fresh_ms(now_ms, _alarm_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            _alarm_bits = 0;
         }
+        _alarm_bits |= alarm;
+        _alarm_ms = now_ms;
+        if (!ZhiannBMS::fresh_ms(now_ms, _warning_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            _warning_bits = 0;
+        }
+        _warning_bits |= warning;
+        _warning_ms = now_ms;
         return true;
     }
 
-    const uint8_t node = cls.node;
-    const uint8_t frame_type = cls.type;
-
-    // fleet inventory: announce each node once so the operator can see
-    // the pack-to-node map (and notice when a claim has migrated)
-    if (!(_nodes_announced & (1U << node))) {
-        _nodes_announced |= (1U << node);
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: pack on node %u", node);
-        // A node appearing means the fleet is still arriving. Restart the
-        // settling window so collision and instance-count warnings wait until
-        // every pack has had a chance to claim; see read(). Plain 32-bit
-        // store, read from the main thread, as with _nodes_announced above.
-        _bus_settle_ms = AP_HAL::millis();
+    if (cls.node > ZhiannBMS::MAX_NODE) {
+        return false;
     }
+    Node &n = _nodes[cls.node];
 
-    // pass 1: an instance already bound to this node (explicit serial
-    // or previously auto-bound)
-    for (uint8_t i = 0; i < _num_instances; i++) {
-        if (_instances[i]->matches_node(node)) {
-            _instances[i]->handle_pack_frame(frame_type, frame);
-            return true;
-        }
+    // fleet inventory: name each node once, and restart the settle window so
+    // the pack count is not announced while packs are still arriving
+    if (!(_nodes_announced & (1U << cls.node))) {
+        _nodes_announced |= (1U << cls.node);
+        _bus_settle_ms = now_ms;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: pack on node %u",
+                      unsigned(cls.node));
     }
+    n.seen = true;
+    n.last_ms = now_ms;
 
-    // pass 2: first unbound auto instance, in BATTn order, unless the
-    // node is explicitly claimed by a not-yet-created instance's serial
-    if (!node_claimed(node)) {
-        for (uint8_t i = 0; i < _num_instances; i++) {
-            AP_BattMonitor_ZhiannBMS &inst = *_instances[i];
-            if (inst._configured_node == -1 && inst._auto_node < 0) {
-                {
-                    WITH_SEMAPHORE(inst._sem);
-                    inst._auto_node = int8_t(node);
-                }
-                inst.handle_pack_frame(frame_type, frame);
-                return true;
-            }
-        }
-    }
+    handle_frame(n, cls.node, cls.type, frame);
+    return true;
+}
 
-    // a pack is broadcasting on a node no battery instance is mapped to:
-    // most likely its node claim migrated (observed when bus membership
-    // changes). Tell the operator which node to look at
+// file one decoded frame into its node's state (CAN driver thread, _sem held)
+void AP_BattMonitor_ZhiannBMS::handle_frame(Node &n, uint8_t node_num,
+                                            uint8_t frame_type,
+                                            const AP_HAL::CANFrame &frame)
+{
+    const uint8_t *d = frame.data;
     const uint32_t now_ms = AP_HAL::millis();
-    for (uint8_t i = 0; i < _num_instances; i++) {
-        _instances[i]->note_unmapped(now_ms);
-    }
-    if (_unmapped_warn_ms[node] == 0 ||
-        now_ms - _unmapped_warn_ms[node] >= 30000) {
-        _unmapped_warn_ms[node] = now_ms;
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "ZhiannBMS: pack on node %u not mapped to any battery",
-                      node);
-    }
-    return false;
-}
-
-// Has the fleet stopped growing? Nothing heard yet counts as unsettled: with
-// no packs on the bus there is nothing worth reporting either way.
-bool AP_BattMonitor_ZhiannBMS::bus_settled(uint32_t now_ms)
-{
-    return _bus_settle_ms != 0 &&
-           now_ms - _bus_settle_ms >= ZHIANN_BUS_SETTLE_MS;
-}
-
-// Name the two packs when the identity frame can see them, so the operator
-// knows which to physically separate; guessing which two cost a day of
-// operations on 2026-08-13. Not every occupied node emits the identity frame,
-// and most collided nodes do not, so fall back to the node number alone.
-void AP_BattMonitor_ZhiannBMS::warn_duplicate(uint32_t now_ms)
-{
-    if (_identity_dup.active(now_ms)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "ZhiannBMS: duplicate node %d: %08X+%08X",
-                      int(bound_node()),
-                      unsigned(_identity_dup.id_a()),
-                      unsigned(_identity_dup.id_b()));
-    } else {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "ZhiannBMS: duplicate pack on node %d",
-                      int(bound_node()));
-    }
-}
-
-void AP_BattMonitor_ZhiannBMS::note_unmapped(uint32_t now_ms)
-{
-    WITH_SEMAPHORE(_sem);
-    _unmapped_ms = now_ms;
-}
-
-void AP_BattMonitor_ZhiannBMS::reconcile_consumption(uint16_t soc_tenths)
-{
-    // PACK_VOLT normally starts the 500ms burst. Waiting for it avoids
-    // reconciling consumed Wh from a zero or stale voltage when SOC arrives first.
-    if (!_current_seen ||
-        !ZhiannBMS::pack_voltage_valid(_interim_state.voltage)) {
-        return;
-    }
-    const float previous_mah = _interim_state.consumed_mah;
-    const float reconciled_mah = ZhiannBMS::reconciled_consumed_mah(
-        previous_mah, _params._pack_capacity, soc_tenths);
-    if (reconciled_mah > previous_mah) {
-        // The BMS has a measured low-current deadband. A falling SOC must
-        // therefore be allowed to raise the capacity-failsafe floor, while an
-        // SOC increase/noise must never discard current-integrated usage.
-        // This same floor governs (re-)seeding: consumption never moves down,
-        // even on the first SOC after a session reset.
-        const float delta_mah = reconciled_mah - previous_mah;
-        _interim_state.consumed_mah = reconciled_mah;
-        _interim_state.consumed_wh += delta_mah *
-            0.001f * _interim_state.voltage;
-    }
-}
-
-void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CANFrame &frame)
-{
-    WITH_SEMAPHORE(_sem);
 
     switch (frame_type) {
-    case ZhiannBMS::FRAME_PACK_VOLT:
-        {
-            const uint64_t now_us = AP_HAL::micros64();
 
-            // voltage anchors liveness: an implausible voltage rejects the
-            // whole frame. Current is judged independently below, so a
-            // current-register fault cannot silence an otherwise live pack.
-            const float voltage = ZhiannBMS::pack_voltage(frame.data);
-            if (!ZhiannBMS::pack_voltage_valid(voltage)) {
-                break;
-            }
-            const float current = ZhiannBMS::current_amps(frame.data) * _curr_mult;
-
-            // duplicate-node detection: two packs interleaved on one node
-            // deliver this ~500ms frame at sub-300ms spacing
-            _dup.feed(AP_HAL::millis());
-            _interim_state.voltage = voltage;
-            if (ZhiannBMS::current_valid(current)) {
-                _interim_state.current_amps = current;
-                // update_consumed skips the first frame and gaps over 2s
-                update_consumed(_interim_state,
-                                ZhiannBMS::consumption_dt_us(now_us - _last_frame_us));
-                _current_seen = true;
-                _current_fault = false;
-            } else {
-                // keep voltage/liveness but hold has_current down and skip
-                // consumption integration until a plausible reading returns
-                _current_fault = true;
-                const uint32_t now_ms = AP_HAL::millis();
-                if (_current_warn_ms == 0 ||
-                    now_ms - _current_warn_ms >= 30000) {
-                    _current_warn_ms = now_ms;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "ZhiannBMS: implausible current from pack on node %d",
-                                  int(bound_node()));
-                }
-            }
-            _interim_state.last_time_micros = uint32_t(now_us);
-            _last_frame_us = now_us;
+    case ZhiannBMS::FRAME_PACK_VOLT: {
+        const float voltage = ZhiannBMS::pack_voltage(d);
+        if (ZhiannBMS::pack_voltage_valid(voltage)) {
+            n.voltage = voltage;
+            n.detail_ms = now_ms;
+        }
+        const float current = ZhiannBMS::current_amps(d) * _curr_mult.get();
+        if (ZhiannBMS::current_valid(current)) {
+            n.current = current;
         }
         break;
+    }
 
-    case ZhiannBMS::FRAME_TEMP_SOC:
-        _last_soc_ms = AP_HAL::millis();
-        // two sensors, signed 0.1C; report the hotter plausible one. One
-        // failed sensor must not blank pack temperature entirely
-        {
-            const float temp1 = ZhiannBMS::temp1_c(frame.data);
-            const float temp2 = ZhiannBMS::temp2_c(frame.data);
-            // raw values are logged as-is so a faulty sensor is identifiable
-            _temp1_c = temp1;
-            _temp2_c = temp2;
-            float selected;
-            if (ZhiannBMS::select_temperature(temp1, temp2, selected)) {
-                _interim_state.temperature = selected;
-                _interim_state.temperature_time = _last_soc_ms;
-            } else if (_temp_warn_ms == 0 ||
-                       _last_soc_ms - _temp_warn_ms >= 30000) {
-                _temp_warn_ms = _last_soc_ms;
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "ZhiannBMS: temperature sensor fault on node %d",
-                              int(bound_node()));
-            }
+    case ZhiannBMS::FRAME_TEMP_SOC: {
+        float temperature;
+        if (ZhiannBMS::select_temperature(ZhiannBMS::temp1_c(d),
+                                          ZhiannBMS::temp2_c(d),
+                                          temperature)) {
+            n.temperature = temperature;
+            n.temp_ms = now_ms;
         }
-        if (ZhiannBMS::soc_fine_valid(frame.data)) {
-            const uint16_t soc_tenths = ZhiannBMS::soc_fine_tenths(frame.data);
-            _soc_pct = soc_tenths / 10;
-            _soc_valid = true;
-            _soc_valid_ms = _last_soc_ms;
-            _fine_soc_ms = _last_soc_ms;
-            reconcile_consumption(soc_tenths);
+        if (ZhiannBMS::soc_fine_valid(d)) {
+            n.soc_tenths = ZhiannBMS::soc_fine_tenths(d);
+            n.soc_ms = now_ms;
+        }
+        break;
+    }
+
+    case ZhiannBMS::FRAME_SOC_COARSE:
+        // Cadence of this frame doubles when two packs share the node, which
+        // is how a collision is spotted. Detection only - it is information.
+        n.dup.feed(now_ms);
+        if (ZhiannBMS::soc_coarse_valid(d) &&
+            !ZhiannBMS::fresh_ms(now_ms, n.soc_ms, ZHIANN_FINE_SOC_STALE_MS)) {
+            n.soc_tenths = uint16_t(ZhiannBMS::soc_coarse_pct(d)) * 10;
+            n.soc_ms = now_ms;
         }
         break;
 
     case ZhiannBMS::FRAME_PACK_ID:
-        // 2s identity frame. Deliberately does NOT refresh _last_frame_us:
-        // it flows in standby too, so treating it as liveness would make a
-        // switched-off pack look like a live one. A lone pack repeats one
-        // id forever; two packs sharing the node alternate between theirs,
-        // which is a duplicate signal needing no timing heuristics and
-        // available before the packs are even switched on.
-        _pack_id = ZhiannBMS::pack_id(frame.data);
-        _identity_dup.feed(_pack_id, AP_HAL::millis());
+        n.pack_id = ZhiannBMS::pack_id(d);
+        n.identity.feed(n.pack_id, now_ms);
         break;
-
-    case ZhiannBMS::FRAME_SOC_COARSE:
-        // this frame keeps flowing in pack standby, when the detail
-        // frames stop: it distinguishes standby from gone-from-bus
-        _last_soc_ms = AP_HAL::millis();
-        // every pack emits this on its own node, so its cadence is the
-        // primary duplicate signal and works before the packs are on
-        _soc_dup.feed(_last_soc_ms);
-        _soc_frame_vmir = ZhiannBMS::soc_voltage_mirror(frame.data);
-        // compare only against a recent (<=500ms) pack-voltage sample: an
-        // older one may straddle a load step and fake a mismatch
-        if (_last_frame_us != 0 &&
-            (AP_HAL::micros64() - _last_frame_us) <= 500000ULL) {
-            _coherence_detector.feed_vmir(ZhiannBMS::pack_vmir_coherent(
-                _interim_state.voltage, _soc_frame_vmir,
-                ZHIANN_CELL_SUM_TOLERANCE_V));
-        }
-        // coarse 1% SOC: used only while the fine 0.1% frame is absent
-        if (ZhiannBMS::soc_coarse_valid(frame.data) &&
-            (_fine_soc_ms == 0 ||
-             AP_HAL::millis() - _fine_soc_ms > ZHIANN_FINE_SOC_STALE_MS)) {
-            _soc_pct = ZhiannBMS::soc_coarse_pct(frame.data);
-            _soc_valid = true;
-            _soc_valid_ms = _last_soc_ms;
-            reconcile_consumption(uint16_t(_soc_pct) * 10U);
-        }
-        break;
-
-    case ZhiannBMS::FRAME_ALARM: {
-        const uint32_t now_ms = AP_HAL::millis();
-        const uint16_t alarm_bits = le16toh_ptr(&frame.data[0]);
-        const uint16_t warning_bits = le16toh_ptr(&frame.data[2]);
-        if (_num_instances == 1) {
-            _alarm_bits = alarm_bits;
-            _warning_bits = warning_bits;
-            _alarm_ms = now_ms;
-            _warning_ms = now_ms;
-        } else {
-            // Alarm source addresses have no proven mapping to proprietary
-            // pack nodes. Preserve the union so a clear frame from another
-            // pack cannot erase an active fault; non-severe MAV faults expire
-            // after the last nonzero alarm rather than on anonymous zeroes.
-            if (alarm_bits != 0) {
-                if (!ZhiannBMS::fresh_ms(now_ms, _alarm_ms,
-                                         AP_BATT_MONITOR_TIMEOUT)) {
-                    _alarm_bits = 0;
-                }
-                _alarm_bits |= alarm_bits;
-                _alarm_ms = now_ms;
-            }
-            if (warning_bits != 0) {
-                if (!ZhiannBMS::fresh_ms(now_ms, _warning_ms,
-                                         AP_BATT_MONITOR_TIMEOUT)) {
-                    _warning_bits = 0;
-                }
-                _warning_bits |= warning_bits;
-                _warning_ms = now_ms;
-            }
-        }
-        break;
-    }
 
     default:
+        // cell slices: publish only complete, atomically assembled sets
         if (frame_type == ZhiannBMS::FRAME_CELL_1_2) {
-            // PACK_VOLT begins the same canonical burst. Preserve that
-            // generation's voltage, plus its arrival time for the freshness
-            // gate below, so readers never compare committed cells with a
-            // later generation's voltage during a load step.
-            _cell_accumulator_voltage = _interim_state.voltage;
-            _cell_voltage_sample_us = _last_frame_us;
+            const uint16_t reported = ZhiannBMS::u16(&d[2]);
+            n.cell_count = reported > 24 ? 24 : uint8_t(reported);
         }
-        if (frame_type == ZhiannBMS::FRAME_CELL_1_2) {
-            // the cell-count word rides in this frame; a pack reporting a
-            // different chemistry/series count deserves a loud explanation
-            // for why cell voltages never publish
-            const uint16_t reported = ZhiannBMS::u16(&frame.data[2]);
-            if (reported != 24) {
-                const uint32_t now_ms = AP_HAL::millis();
-                if (_cellcount_warn_ms == 0 ||
-                    now_ms - _cellcount_warn_ms >= 30000) {
-                    _cellcount_warn_ms = now_ms;
-                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                                  "ZhiannBMS: pack on node %d reports %u cells, expected 24",
-                                  int(bound_node()), unsigned(reported));
-                }
+        if (n.accumulator.feed(frame_type, d, now_ms,
+                               ZHIANN_CELL_SNAPSHOT_SPAN_MS)) {
+            const uint16_t *cells = n.accumulator.cells();
+            for (uint8_t i = 0; i < ARRAY_SIZE(n.cells); i++) {
+                n.cells[i] = cells[i];
             }
-        }
-        if (_cell_accumulator.feed(frame_type, frame.data, AP_HAL::millis(),
-                                   ZHIANN_CELL_SNAPSHOT_SPAN_MS)) {
-            const uint16_t *cells = _cell_accumulator.cells();
-            // compare only against a recent (<=500ms) voltage sample from
-            // this burst: an older one may straddle a load step and fake a
-            // mismatch (same freshness gate as the SOC voltage mirror)
-            bool coherent = false;
-            if (_cell_voltage_sample_us != 0 &&
-                (AP_HAL::micros64() - _cell_voltage_sample_us) <= 500000ULL) {
-                coherent = ZhiannBMS::pack_cells_coherent(
-                    _cell_accumulator_voltage, cells, 24,
-                    ZHIANN_CELL_SUM_TOLERANCE_V);
-                _coherence_detector.feed_cellsum(coherent);
-            }
-            // an incoherent generation is detector evidence only: it must
-            // never reach the published cell state. Publication stays on
-            // the previous coherent snapshot until that ages past the 5s
-            // freshness window in read()
-            if (coherent) {
-                for (uint8_t i = 0; i < ARRAY_SIZE(_cells24); i++) {
-                    _cells24[i] = cells[i];
-                    if (i < ARRAY_SIZE(_interim_state.cell_voltages.cells)) {
-                        _interim_state.cell_voltages.cells[i] = cells[i];
-                    }
-                }
-                _cell_count = uint8_t(_cell_accumulator.cell_count());
-                _last_coherent_snapshot_ms = AP_HAL::millis();
-            }
-            _cell_accumulator.reset();
+            n.cells_ms = now_ms;
+            n.accumulator.reset();
         }
         break;
     }
+    (void)node_num;
 }
 
-// one-time audit of static configuration errors, run from the first read()
-// (all instances exist and have snapshotted their serial parameter by then)
-void AP_BattMonitor_ZhiannBMS::announce_misconfiguration()
+// Reduce every fresh node to one battery. Returns how many packs contributed.
+uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
 {
-    for (uint8_t i = 0; i < _num_instances; i++) {
-        // parameter-name suffix digit: BATT for instance 0, BATT2.. beyond
-        // (same convention as the front-end's param prefix)
-        char pfx_i[3] {};
-        if (_instances[i]->_state.instance > 0) {
-            hal.util->snprintf(pfx_i, sizeof(pfx_i), "%X",
-                               unsigned(_instances[i]->_state.instance + 1));
-        }
-        const int8_t node = _instances[i]->_configured_node;
-        if (node == -2) {
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "ZhiannBMS: BATT%s_SERIAL_NUM invalid", pfx_i);
+    float v_sum = 0, i_sum = 0, soc_sum = 0, t_max = 0;
+    float v_sq = 0, i_sq = 0, soc_sq = 0;
+    uint32_t cell_sum[24] {};
+    uint8_t live = 0, with_cells = 0, with_temp = 0, with_current = 0;
+    _dup_any = false;
+
+    for (uint8_t node = 0; node < ARRAY_SIZE(_nodes); node++) {
+        Node &n = _nodes[node];
+        if (!ZhiannBMS::fresh_ms(now_ms, n.last_ms, ZHIANN_NODE_TIMEOUT_MS)) {
             continue;
         }
-        if (node < 0) {
+        if (n.dup.active(now_ms) || n.identity.active(now_ms)) {
+            _dup_any = true;
+        }
+        // a node with no pack voltage yet is present but not contributing
+        // (a pack in standby broadcasts SOC only)
+        if (!ZhiannBMS::fresh_ms(now_ms, n.detail_ms, ZHIANN_NODE_TIMEOUT_MS)) {
             continue;
         }
-        for (uint8_t j = 0; j < i; j++) {
-            if (_instances[j]->_configured_node == node) {
-                char pfx_j[3] {};
-                if (_instances[j]->_state.instance > 0) {
-                    hal.util->snprintf(pfx_j, sizeof(pfx_j), "%X",
-                                       unsigned(_instances[j]->_state.instance + 1));
-                }
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "ZhiannBMS: BATT%s_SERIAL_NUM duplicates BATT%s",
-                              pfx_i, pfx_j);
-                break;
+        live++;
+        v_sum += n.voltage;
+        v_sq += n.voltage * n.voltage;
+        i_sum += n.current;
+        i_sq += n.current * n.current;
+        with_current++;
+        if (ZhiannBMS::fresh_ms(now_ms, n.soc_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            const float soc = n.soc_tenths * 0.1f;
+            soc_sum += soc;
+            soc_sq += soc * soc;
+        }
+        if (ZhiannBMS::fresh_ms(now_ms, n.temp_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            if (with_temp == 0 || n.temperature > t_max) {
+                t_max = n.temperature;
             }
+            with_temp++;
+        }
+        if (n.cell_count == 24 &&
+            ZhiannBMS::fresh_ms(now_ms, n.cells_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            for (uint8_t c = 0; c < 24; c++) {
+                cell_sum[c] += n.cells[c];
+            }
+            with_cells++;
         }
     }
 
-    // CANSensor binds only the first port carrying this protocol
-    uint8_t ports = 0;
-    for (uint8_t i = 0; i < HAL_MAX_CAN_PROTOCOL_DRIVERS; i++) {
-        if (AP::can().get_driver_type(i) == AP_CAN::Protocol::ZhiannBMS) {
-            ports++;
+    if (live == 0) {
+        // no pack delivering: report zero rather than freezing the last
+        // reading. 0V is ArduPilot's no-reading convention and cannot trip
+        // the voltage failsafes, which are guarded by voltage > 0.
+        _state.healthy = false;
+        _state.voltage = 0;
+        _state.current_amps = 0;
+        _has_cell_voltages = false;
+        _has_temperature = false;
+        _soc_valid = false;
+        _sd_voltage = _sd_current = _sd_soc = _mean_current = 0;
+        memset(_state.cell_voltages.cells, 0xFF,
+               sizeof(_state.cell_voltages.cells));
+        _consumed_us = 0;
+        return 0;
+    }
+
+    const float inv = 1.0f / live;
+    _state.voltage = v_sum * inv;
+    _state.current_amps = i_sum;      // parallel packs: the set draws the sum
+    _mean_current = i_sum * inv;
+    _sd_voltage = ZhiannBMS::stdev(v_sum, v_sq, live);
+    _sd_current = ZhiannBMS::stdev(i_sum, i_sq, live);
+
+    _soc_valid = false;
+    if (soc_sum > 0 || live > 0) {
+        const float soc_mean = soc_sum * inv;
+        _soc_pct = uint8_t(constrain_float(soc_mean + 0.5f, 0, 100));
+        _sd_soc = ZhiannBMS::stdev(soc_sum, soc_sq, live);
+        _soc_valid = true;
+    }
+
+    _has_temperature = with_temp > 0;
+    if (_has_temperature) {
+        _state.temperature = t_max;
+        _state.temperature_time = now_ms;
+    }
+
+    _has_cell_voltages = with_cells > 0;
+    if (_has_cell_voltages) {
+        for (uint8_t c = 0; c < ARRAY_SIZE(_state.cell_voltages.cells); c++) {
+            _state.cell_voltages.cells[c] = uint16_t(cell_sum[c] / with_cells);
         }
+    } else {
+        memset(_state.cell_voltages.cells, 0xFF,
+               sizeof(_state.cell_voltages.cells));
     }
-    if (ports > 1) {
-        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                      "ZhiannBMS: protocol on multiple CAN ports; only first is used");
+
+    // consumption from the summed current, integrated once for the set
+    _has_current = with_current > 0;
+    if (_has_current) {
+        if (_consumed_us != 0) {
+            const uint32_t dt_us =
+                ZhiannBMS::consumption_dt_us(now_us - _consumed_us);
+            if (dt_us > 0) {
+                _state.last_time_micros = uint32_t(now_us);
+                update_consumed(_state, dt_us);
+            }
+        }
+        _consumed_us = now_us;
     }
+
+    _state.healthy = true;
+    return live;
 }
 
 void AP_BattMonitor_ZhiannBMS::read()
 {
-    if (!_misconfig_checked) {
-        _misconfig_checked = true;
-        announce_misconfiguration();
+    if (_singleton != this) {
+        // a second monitor of this type would publish a duplicate of the same
+        // battery; keep it plainly unhealthy rather than silently wrong
+        _state.healthy = false;
+        return;
     }
 
     WITH_SEMAPHORE(_sem);
-
-    // 64-bit micros: no wraparound resurrection after long silence
-    const uint64_t tnow_us = AP_HAL::micros64();
     const uint32_t now_ms = AP_HAL::millis();
+    const uint64_t now_us = AP_HAL::micros64();
 
-    // Liveness for this instance, latched for the session. Must be set on
-    // EVERY path, not just the outage branch: the FC is powered from the
-    // packs, so frames are already arriving before the first read() and a
-    // healthy instance would otherwise never record that it was ever heard.
-    // The unbound-instance warning below counts peers by this flag.
-    if (_last_frame_us != 0 || _last_soc_ms != 0) {
-        _ever_heard = true;
-    }
-
-    // Arming restarts the coherence hold window, so the cap always measures
-    // how long a fault has been gating health IN FLIGHT. Without this a
-    // fault carried in from the ground is already past the cap at the arm
-    // instant and contributes nothing for the whole flight.
-    const bool armed = hal.util->get_soft_armed();
-    if (armed && !_was_armed) {
-        _coherence_since_ms = 0;
-    }
-    _was_armed = armed;
-
-    // Expire fault telemetry even when detail traffic has stopped.
+    // expire alarm telemetry rather than latching it
     if (_alarm_ms != 0 &&
-        !ZhiannBMS::fresh_ms(now_ms, _alarm_ms, AP_BATT_MONITOR_TIMEOUT)) {
+        !ZhiannBMS::fresh_ms(now_ms, _alarm_ms, ZHIANN_NODE_TIMEOUT_MS)) {
         _alarm_bits = 0;
         _alarm_ms = 0;
     }
     if (_warning_ms != 0 &&
-        !ZhiannBMS::fresh_ms(now_ms, _warning_ms, AP_BATT_MONITOR_TIMEOUT)) {
+        !ZhiannBMS::fresh_ms(now_ms, _warning_ms, ZHIANN_NODE_TIMEOUT_MS)) {
         _warning_bits = 0;
         _warning_ms = 0;
     }
-    // Alarms are messages only: they feed the MAVLink fault bitmask, the
-    // ZBMS log and a periodic operator warning, and never gate health.
+
     uint32_t faults = 0;
-    if (ZhiannBMS::fresh_ms(now_ms, _alarm_ms, AP_BATT_MONITOR_TIMEOUT)) {
-        const uint16_t a = _alarm_bits;
-        if (a & (ZHIANN_ALARM_DIS_OVERCURRENT | ZHIANN_ALARM_CHG_OVERCURRENT)) {
-            faults |= MAV_BATTERY_FAULT_OVER_CURRENT;
-        }
-        if (a & ZHIANN_ALARM_HIGH_TEMP) {
-            faults |= MAV_BATTERY_FAULT_OVER_TEMPERATURE;
-        }
-        if (a & ZHIANN_ALARM_LOW_TEMP) {
-            faults |= MAV_BATTERY_FAULT_UNDER_TEMPERATURE;
-        }
-        if (a & ZHIANN_ALARM_CELL_UNDERVOLT) {
-            faults |= MAV_BATTERY_FAULT_DEEP_DISCHARGE;
-        }
-        if (a & ZHIANN_ALARM_CELL_OVERVOLT) {
-            faults |= MAV_BATTERY_FAULT_SPIKES;
-        }
-        if (a & (ZHIANN_ALARM_SEVERE | ZHIANN_ALARM_TEMP_SENSOR)) {
-            faults |= MAV_BATTERY_FAULT_CELL_FAIL;
-        }
-        // remind the operator every 10s while any alarm bit stays active,
-        // naming the bits. Alarms are anonymous unions delivered to every
-        // instance, so only the first instance speaks for the fleet
-        if (a != 0 && this == _instances[0] &&
-            (_alarm_gcs_ms == 0 || now_ms - _alarm_gcs_ms >= 10000)) {
-            _alarm_gcs_ms = now_ms;
-            char names[40] {};
-            uint8_t used = 0;
-            uint16_t unnamed = a;
-            for (const auto &an : zhiann_alarm_names) {
-                if (!(a & an.mask)) {
-                    continue;
-                }
-                unnamed &= ~an.mask;
-                const int w = hal.util->snprintf(&names[used],
-                                                 sizeof(names) - used, "%s%s",
-                                                 used ? ", " : "", an.name);
-                if (w <= 0 || uint32_t(used) + uint32_t(w) >= sizeof(names)) {
-                    used = sizeof(names) - 1;
-                    break;
-                }
-                used += uint8_t(w);
-            }
-            if (unnamed != 0 && used < sizeof(names) - 1) {
-                hal.util->snprintf(&names[used], sizeof(names) - used,
-                                   "%s0x%X", used ? ", " : "",
-                                   unsigned(unnamed));
-            }
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: BMS alarm: %s",
-                          names);
-        }
+    const uint16_t a = _alarm_bits;
+    if (a & (ZHIANN_ALARM_DIS_OVERCURRENT | ZHIANN_ALARM_CHG_OVERCURRENT)) {
+        faults |= MAV_BATTERY_FAULT_OVER_CURRENT;
+    }
+    if (a & ZHIANN_ALARM_HIGH_TEMP) {
+        faults |= MAV_BATTERY_FAULT_OVER_TEMPERATURE;
+    }
+    if (a & ZHIANN_ALARM_LOW_TEMP) {
+        faults |= MAV_BATTERY_FAULT_UNDER_TEMPERATURE;
+    }
+    if (a & ZHIANN_ALARM_CELL_UNDERVOLT) {
+        faults |= MAV_BATTERY_FAULT_DEEP_DISCHARGE;
+    }
+    if (a & ZHIANN_ALARM_CELL_OVERVOLT) {
+        faults |= MAV_BATTERY_FAULT_SPIKES;
+    }
+    if (a & (ZHIANN_ALARM_SEVERE | ZHIANN_ALARM_TEMP_SENSOR)) {
+        faults |= MAV_BATTERY_FAULT_CELL_FAIL;
     }
     _fault_bitmask = faults;
-    _unmapped_active = ZhiannBMS::fresh_ms(now_ms, _unmapped_ms,
-                                           AP_BATT_MONITOR_TIMEOUT);
 
-    if (_last_frame_us == 0 ||
-        (tnow_us - _last_frame_us) > ZHIANN_TIMEOUT_US) {
-        // BMS gone: report zero rather than freezing the last reading.
-        // 0V is ArduPilot's "no reading" convention and cannot trigger
-        // the voltage failsafes, which are guarded by voltage > 0
-        _state.healthy = false;
-        _state.voltage = 0;
-        _state.current_amps = 0;
-        _soc_valid_pub = false;
-        _has_cell_voltages = false;
-        _has_temperature = false;
-        _coherence_fault = false;
-        _coherence_since_ms = 0;
-        // The cadence detector needs detail frames, so it cannot speak here.
-        // The identity frame keeps flowing in standby, so a duplicate node is
-        // still detectable — and this is the most useful moment to say so,
-        // before the packs are switched on and anyone tries to arm.
-        // Neither _soc_dup nor _identity_dup is reset here: both are fed from
-        // frames that keep flowing in standby, and clearing them would blind
-        // exactly the case this branch exists to report.
-        _dup_active = _soc_dup.active(now_ms) || _identity_dup.active(now_ms);
-        if (_dup_active && bus_settled(now_ms) &&
-            (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
-            _dup_warn_ms = now_ms;
-            warn_duplicate(now_ms);
-        }
-        _dup.reset_qualification();
-        _soc_valid = false;
-        _soc_valid_ms = 0;
-        _fine_soc_ms = 0;
-        _interim_state.temperature_time = 0;
-        _interim_state.last_time_micros = 0;
-        // _current_seen and _has_current are deliberately preserved at
-        // their last values, so when current was good at outage onset the
-        // capacity failsafes remain armed across a BMS outage; consumption
-        // re-seeding is floored by reconcile_consumption() when the pack
-        // returns
-        memset(_interim_state.cell_voltages.cells, 0xFF,
-               sizeof(_interim_state.cell_voltages.cells));
-        memset(_state.cell_voltages.cells, 0xFF,
-               sizeof(_state.cell_voltages.cells));
-        memset(_cells24, 0xFF, sizeof(_cells24));
-        _cell_accumulator.reset();
-        _cell_accumulator_voltage = 0;
-        _cell_voltage_sample_us = 0;
-        _last_coherent_snapshot_ms = 0;
-        _cell_count = 0;
-        // session boundary: a half-armed coherence strike from before the
-        // outage must not pair with the new session's first mismatch (an
-        // accumulated active score is deliberately preserved as evidence)
-        _coherence_detector.clear_pending();
-
-        // SOC frames still arriving means the pack is present but in
-        // standby (its detail frames stop): tell the operator, since the
-        // fix is pressing the pack's power button, not checking wiring
-        _standby = ZhiannBMS::fresh_ms(now_ms, _last_soc_ms,
-                                      AP_BATT_MONITOR_TIMEOUT);
-        if (_standby && (_standby_warn_ms == 0 ||
-                         now_ms - _standby_warn_ms >= 30000)) {
-            _standby_warn_ms = now_ms;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "ZhiannBMS: pack on node %d in standby",
-                          int(bound_node()));
-        }
-
-        // A configured instance that never binds while other packs are live
-        // is a configuration mismatch, not a failed pack. ArduPilot surfaces
-        // it as "Battery N is missing, last: 0.00V", which reads like a dead
-        // battery; on 2026-08-13 four instances were configured against three
-        // distinct nodes (two packs had collided) and that message sent the
-        // crew hunting a hardware fault for a day.
-        //
-        // Keyed on LIVENESS, not on bound_node(): an instance with an
-        // explicit BATTn_SERIAL_NUM reports a bound node whether or not any
-        // pack was ever heard there, so a bound-node test would never fire in
-        // the primary documented configuration. _ever_heard is set at the top
-        // of read() on every path; the peer reads below are main-thread-only
-        // values also written under read().
-        if (!_ever_heard && bus_settled(now_ms) &&
-            (_unbound_warn_ms == 0 || now_ms - _unbound_warn_ms >= 30000)) {
-            uint8_t live = 0;
-            for (uint8_t i = 0; i < _num_instances; i++) {
-                if (_instances[i] != this && _instances[i]->_ever_heard) {
-                    live++;
-                }
+    // alarms are messages only, per operator ruling: they never gate health
+    if (a != 0 && (_alarm_gcs_ms == 0 || now_ms - _alarm_gcs_ms >= 10000)) {
+        _alarm_gcs_ms = now_ms;
+        char names[40] {};
+        uint8_t used = 0;
+        uint16_t unnamed = a;
+        for (const auto &an : zhiann_alarm_names) {
+            if (!(a & an.mask)) {
+                continue;
             }
-            if (live > 0) {
-                _unbound_warn_ms = now_ms;
-                // parameter-name suffix: BATT_ for instance 0, BATT2_ beyond
-                // (same convention as announce_misconfiguration())
-                char pfx[3] {};
-                if (_state.instance > 0) {
-                    hal.util->snprintf(pfx, sizeof(pfx), "%X",
-                                       unsigned(_state.instance + 1));
-                }
-                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                              "ZhiannBMS: BATT%s configured, only %u pack%s on bus",
-                              pfx, unsigned(live), live == 1 ? "" : "s");
+            unnamed &= ~an.mask;
+            const int w = hal.util->snprintf(&names[used], sizeof(names) - used,
+                                             "%s%s", used ? ", " : "", an.name);
+            if (w <= 0 || uint32_t(used) + uint32_t(w) >= sizeof(names)) {
+                used = sizeof(names) - 1;
+                break;
             }
+            used += uint8_t(w);
         }
-        log_zbms();
-        return;
-    }
-    _standby = false;
-
-    _state.healthy = true;
-    _state.voltage = _interim_state.voltage;
-    // While the current register is faulted, publish 0A (the no-reading
-    // convention) rather than the stale last-good reading. Note: with a
-    // persistent current fault the mAh capacity failsafes are inactive
-    // (has_current false) and the voltage failsafes are the backstop.
-    _state.current_amps = _current_fault ? 0 : _interim_state.current_amps;
-    _state.consumed_mah = _interim_state.consumed_mah;
-    _state.consumed_wh = _interim_state.consumed_wh;
-    _state.last_time_micros = _interim_state.last_time_micros;
-    _state.temperature = _interim_state.temperature;
-    _state.temperature_time = _interim_state.temperature_time;
-    _soc_pct_pub = _soc_pct;
-    _soc_valid_pub = _soc_valid &&
-        ZhiannBMS::fresh_ms(now_ms, _soc_valid_ms, AP_BATT_MONITOR_TIMEOUT);
-    _has_current = _current_seen && !_current_fault;
-    _has_temperature = ZhiannBMS::fresh_ms(now_ms,
-                                           _interim_state.temperature_time,
-                                           AP_BATT_MONITOR_TIMEOUT);
-
-    // An unmonitored pack on a parallel fleet is a system-level safety
-    // violation even when this particular mapped pack is otherwise healthy.
-    if (_unmapped_active) {
-        _state.healthy = false;
-    }
-
-    // Publication and health key off the last COHERENT complete snapshot
-    // staying inside the standard 5s freshness window: one incoherent
-    // 500ms generation (e.g. a throttle punch straddling a burst) must not
-    // blip health, while sustained incoherence still fails via both this
-    // window and the coherence detector.
-    const bool cell_snapshot_valid = _cell_count == 24 &&
-        ZhiannBMS::fresh_ms(now_ms, _last_coherent_snapshot_ms,
-                            AP_BATT_MONITOR_TIMEOUT);
-    if (cell_snapshot_valid) {
-        for (uint8_t i = 0; i < ARRAY_SIZE(_state.cell_voltages.cells); i++) {
-            _state.cell_voltages.cells[i] =
-                _interim_state.cell_voltages.cells[i];
+        if (unnamed != 0 && used < sizeof(names) - 1) {
+            hal.util->snprintf(&names[used], sizeof(names) - used, "%s0x%X",
+                               used ? ", " : "", unsigned(unnamed));
         }
-    } else {
-        memset(_interim_state.cell_voltages.cells, 0xFF,
-               sizeof(_interim_state.cell_voltages.cells));
-        memset(_state.cell_voltages.cells, 0xFF,
-               sizeof(_state.cell_voltages.cells));
-        memset(_cells24, 0xFF, sizeof(_cells24));
-        _cell_count = 0;
-    }
-    _coherence_fault = _coherence_detector.active();
-    _has_cell_voltages = cell_snapshot_valid;
-    if (_coherence_fault) {
-        if (_coherence_since_ms == 0) {
-            _coherence_since_ms = now_ms;
-        }
-        // Bound how long coherence alone may hold health down. ArduPilot
-        // raises Failsafe::Unhealthy after 5s without a healthy reading, and
-        // in Copter that failsafe LATCHES for the rest of the flight: buzzer
-        // throughout, "Bad Battery" on the HUD, re-arm blocked until reboot.
-        // A PSC_ACCZ tuning oscillation on 2026-07-24 produced a 5.6s trip
-        // and did exactly that with the packs healthy throughout (cell
-        // spread 7-19mV either side). The fault is measurement skew: the
-        // 24-cell snapshot spans up to 250ms of frames while PACK voltage is
-        // a different instant, so a fast load step makes them disagree.
-        // Keep reporting it, but stop gating health past the cap so a
-        // transient can never latch a failsafe in flight.
-        //
-        // The cap applies ONLY while armed. On the ground the pre-arm gate
-        // stays absolute: arming_checks() keys directly off healthy(), and a
-        // sustained disagreement between two independent voltage sources
-        // must keep blocking arming for as long as it lasts. Relaxing that
-        // was never the goal, and the coherence detector only clears its
-        // score on a coherent check, so a persistent fault would otherwise
-        // stop gating health permanently after the first 3s.
-        //
-        // The cap bounds THIS gate only. Incoherent generations are never
-        // committed, so _last_coherent_snapshot_ms stops advancing and the
-        // cell-freshness gate below independently fails health from 5s
-        // onward. Health therefore goes false 0-3s, true 3-5s (which
-        // refreshes ArduPilot's last_healthy_ms and disarms the pending
-        // failsafe), then false again from 5s. The net effect is that a
-        // coherence fault shorter than ~10s cannot latch a failsafe, which
-        // covers the 5.6s event above; a fault sustained beyond that still
-        // latches, deliberately, because 24 cells that have not agreed with
-        // pack voltage for ten seconds are not a battery worth trusting.
-        if (!armed || now_ms - _coherence_since_ms < ZHIANN_COHERENCE_HOLD_MS) {
-            _state.healthy = false;
-        }
-        if (_coherence_warn_ms == 0 || now_ms - _coherence_warn_ms >= 30000) {
-            _coherence_warn_ms = now_ms;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "ZhiannBMS: incoherent data on node %d",
-                          int(bound_node()));
-        }
-    } else {
-        _coherence_since_ms = 0;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: BMS alarm: %s", names);
     }
 
-    // A PACK frame alone is not a coherent battery snapshot. Do not permit
-    // arming until SOC, temperature, cell count, and all seven cell slices
-    // have arrived and remain fresh.
-    if (!_soc_valid_pub || !_has_temperature || !_has_cell_voltages) {
-        _state.healthy = false;
-    }
+    const uint8_t live = aggregate(now_ms, now_us);
 
-    // two packs sharing this node interleave their data: readings are a
-    // physically meaningless mixture, so report unhealthy and tell the
-    // operator why (hysteresis inside the detector stops flapping)
-    // Three signals, any of which means duplicate:
-    //  - SOC-coarse cadence: primary, every pack emits it on its own node
-    //  - PACK_VOLT cadence: the original detector, detail frames only
-    //  - identity: seen on some nodes only, but names the packs when present
-    const bool identity_dup = _identity_dup.active(now_ms);
-    _dup_active = _soc_dup.active(now_ms) || _dup.active() || identity_dup;
-    if (_dup_active || !_dup.qualified()) {
-        _state.healthy = false;
-    }
-    if (_dup_active && bus_settled(now_ms) &&
-        (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
-        _dup_warn_ms = now_ms;
-        warn_duplicate(now_ms);
-    }
-
-    log_zbms();
+    report_inventory(now_ms, live);
+    report_imbalance(now_ms);
+    log_zbms(now_ms, live);
 }
 
-// three dataflash messages per instance at 2Hz:
-//   ZBMS: node, state flags, pack voltage/current, fine SOC, both temps,
-//         alarm/warning words, SOC-frame voltage mirror, cell count, age
-//   ZBC1: cells 1-12 (mV)   ZBC2: cells 13-24 (mV)
-void AP_BattMonitor_ZhiannBMS::log_zbms()
+// Information only. The operator needs to know how many packs the aircraft
+// found and whether any node looks like two packs; neither gates arming,
+// because checking the count against what was loaded is a preflight step.
+void AP_BattMonitor_ZhiannBMS::report_inventory(uint32_t now_ms, uint8_t live)
 {
-#if HAL_LOGGING_ENABLED
-    const uint32_t now_ms = AP_HAL::millis();
-    // Gated on liveness, not on PACK_VOLT: a pack that has only ever been in
-    // standby emits SOC frames and no detail frames, and its duplicate and
-    // identity state is exactly what post-flight analysis needs. An instance
-    // that has never heard anything still logs nothing.
-    if (!_ever_heard || now_ms - _last_log_ms < 500) {
+    const bool settled = _bus_settle_ms != 0 &&
+                         now_ms - _bus_settle_ms >= ZHIANN_BUS_SETTLE_MS;
+    if (!settled) {
         return;
     }
-    _last_log_ms = now_ms;
 
-    const bool soc_fine = _fine_soc_ms != 0 &&
-        (now_ms - _fine_soc_ms) <= ZHIANN_FINE_SOC_STALE_MS;
-    const uint8_t flags = (_state.healthy ? 1U : 0) |
-                          (_standby ? 2U : 0) |
-                          (_dup_active ? 4U : 0) |
-                          (soc_fine ? 8U : 0) |
-                          (_current_seen ? 16U : 0) |
-                          (_unmapped_active ? 32U : 0) |
-                          (_coherence_fault ? 64U : 0) |
-                          (_current_fault ? 128U : 0);
-    const uint64_t now_us = AP_HAL::micros64();
-    // a pack that has only ever been in standby has no PACK_VOLT frame, but
-    // its duplicate/identity state is exactly what post-flight analysis needs
-    const uint64_t age_ms_64 = _last_frame_us == 0 ? UINT16_MAX :
-                               (now_us - _last_frame_us) / 1000ULL;
-    const uint16_t age_ms = age_ms_64 > UINT16_MAX ? UINT16_MAX :
-                            uint16_t(age_ms_64);
+    if (!_inventory_done) {
+        _inventory_done = true;
+        _expected_packs = live;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: %u pack%s delivering",
+                      unsigned(live), live == 1 ? "" : "s");
+    }
 
-    // Labels are at the dataflash schema limit, so Vm/NC are abbreviated to
-    // make room for the pack id (was Vmir/NCel before 2026-08-14).
-    static_assert(sizeof("TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vm,NC,Age,ID") <= LS_LABELS_SIZE,
-                  "ZBMS labels exceed dataflash schema limit");
-    // @LoggerMessage: ZBMS
-    // @Description: Zhiann BMS pack status
-    // @Field: TimeUS: Time since system startup
-    // @Field: Inst: Battery monitor instance
-    // @Field: Node: Proprietary broadcast node
-    // @Field: Flag: Health, standby, collision, SOC source, current, unmapped and coherence flags
-    // @Field: Volt: Pack voltage
-    // @Field: Curr: Pack current, discharge positive
-    // @Field: SOC: BMS state of charge
-    // @Field: T1: Temperature sensor 1
-    // @Field: T2: Temperature sensor 2
-    // @Field: Alm: Vendor alarm bitmask
-    // @Field: Warn: Vendor warning bitmask
-    // @Field: Vm: Raw SOC-frame voltage mirror, in 1/320 volt
-    // @Field: NC: Reported cell count
-    // @Field: Age: Milliseconds since the last valid pack frame
-    // @Field: ID: Per-pack identity from the 2s frame; identifies which physical pack is on this node
-    AP::logger().WriteStreaming(
-        "ZBMS", "TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vm,NC,Age,ID",
-        "s#--vA%OO------", "F---00000------",
-        "QBbBffBffHHHBHI",
-        now_us,
-        _state.instance,
-        (int8_t)bound_node(),
-        flags,
-        (double)_interim_state.voltage,
-        (double)_interim_state.current_amps,
-        _soc_pct,
-        (double)_temp1_c,
-        (double)_temp2_c,
-        _alarm_bits,
-        _warning_bits,
-        _soc_frame_vmir,
-        _cell_count,
-        age_ms,
-        _pack_id);
+    // A collision means one node is carrying two packs' frames, so the pack
+    // count reads low. Say so, so the number above is not mistaken for a
+    // missing pack.
+    if (_dup_any && (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
+        _dup_warn_ms = now_ms;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "ZhiannBMS: a node carries 2 packs, count reads low");
+    }
 
-    const uint16_t *c = _cells24;
-    // @LoggerMessage: ZBC1
-    // @Description: Zhiann BMS cell voltages 1 through 12
-    // @Field: TimeUS: Time since system startup
-    // @Field: Inst: Battery monitor instance
-    // @Field: V1: Cell 1 voltage
-    // @Field: V2: Cell 2 voltage
-    // @Field: V3: Cell 3 voltage
-    // @Field: V4: Cell 4 voltage
-    // @Field: V5: Cell 5 voltage
-    // @Field: V6: Cell 6 voltage
-    // @Field: V7: Cell 7 voltage
-    // @Field: V8: Cell 8 voltage
-    // @Field: V9: Cell 9 voltage
-    // @Field: V10: Cell 10 voltage
-    // @Field: V11: Cell 11 voltage
-    // @Field: V12: Cell 12 voltage
-    AP::logger().WriteStreaming(
-        "ZBC1", "TimeUS,Inst,V1,V2,V3,V4,V5,V6,V7,V8,V9,V10,V11,V12",
-        "s#vvvvvvvvvvvv", "F-CCCCCCCCCCCC",
-        "QBHHHHHHHHHHHH",
-        now_us, _state.instance,
-        c[0], c[1], c[2], c[3], c[4], c[5],
-        c[6], c[7], c[8], c[9], c[10], c[11]);
-    // @LoggerMessage: ZBC2
-    // @Description: Zhiann BMS cell voltages 13 through 24
-    // @Field: TimeUS: Time since system startup
-    // @Field: Inst: Battery monitor instance
-    // @Field: V13: Cell 13 voltage
-    // @Field: V14: Cell 14 voltage
-    // @Field: V15: Cell 15 voltage
-    // @Field: V16: Cell 16 voltage
-    // @Field: V17: Cell 17 voltage
-    // @Field: V18: Cell 18 voltage
-    // @Field: V19: Cell 19 voltage
-    // @Field: V20: Cell 20 voltage
-    // @Field: V21: Cell 21 voltage
-    // @Field: V22: Cell 22 voltage
-    // @Field: V23: Cell 23 voltage
-    // @Field: V24: Cell 24 voltage
-    AP::logger().WriteStreaming(
-        "ZBC2", "TimeUS,Inst,V13,V14,V15,V16,V17,V18,V19,V20,V21,V22,V23,V24",
-        "s#vvvvvvvvvvvv", "F-CCCCCCCCCCCC",
-        "QBHHHHHHHHHHHH",
-        now_us, _state.instance,
-        c[12], c[13], c[14], c[15], c[16], c[17],
-        c[18], c[19], c[20], c[21], c[22], c[23]);
-#endif
+    // Losing a pack in flight leaves the rest carrying its share.
+    if (live < _expected_packs &&
+        (_lost_warn_ms == 0 || now_ms - _lost_warn_ms >= 30000)) {
+        _lost_warn_ms = now_ms;
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: %u of %u packs, lost %u",
+                      unsigned(live), unsigned(_expected_packs),
+                      unsigned(_expected_packs - live));
+    }
+}
+
+// One pack behaving unlike the others is the failure the averaging would
+// otherwise hide, so measure the spread and say when it stops being normal.
+void AP_BattMonitor_ZhiannBMS::report_imbalance(uint32_t now_ms)
+{
+    const char *what = nullptr;
+    float value = 0;
+
+    if (_sd_voltage > ZHIANN_IMBALANCE_V_SD) {
+        what = "V";
+        value = _sd_voltage;
+    } else if (_sd_soc > ZHIANN_IMBALANCE_SOC_SD) {
+        what = "SOC";
+        value = _sd_soc;
+    } else if (fabsf(_mean_current) > ZHIANN_IMBALANCE_I_FLOOR &&
+               _sd_current > ZHIANN_IMBALANCE_I_SD) {
+        what = "A";
+        value = _sd_current;
+    }
+    if (what == nullptr) {
+        return;
+    }
+    if (_imbalance_warn_ms != 0 && now_ms - _imbalance_warn_ms < 30000) {
+        return;
+    }
+    _imbalance_warn_ms = now_ms;
+    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "ZhiannBMS: packs differ, %s sd %.1f",
+                  what, (double)value);
 }
 
 bool AP_BattMonitor_ZhiannBMS::capacity_remaining_pct(uint8_t &percentage) const
 {
-    if (_state.healthy && _soc_valid_pub) {
-        percentage = _soc_pct_pub;
+    if (_state.healthy && _soc_valid) {
+        percentage = _soc_pct;
         return true;
     }
-    // Preserve the base behavior for any future configuration that permits a
-    // healthy current-only state. Current policy makes stale SOC unhealthy.
     return AP_BattMonitor_Backend::capacity_remaining_pct(percentage);
+}
+
+// ZBMS at 2Hz: the aggregate plus the spread that produced it, then one row
+// per live node so a single misbehaving pack can be found after the fact.
+void AP_BattMonitor_ZhiannBMS::log_zbms(uint32_t now_ms, uint8_t live)
+{
+#if HAL_LOGGING_ENABLED
+    if (now_ms - _last_log_ms < 500) {
+        return;
+    }
+    _last_log_ms = now_ms;
+    const uint64_t now_us = AP_HAL::micros64();
+
+    // @LoggerMessage: ZBMS
+    // @Description: Zhiann BMS pack set, aggregated as one battery
+    // @Field: TimeUS: Time since system startup
+    // @Field: Np: Packs delivering data
+    // @Field: Dup: A node appears to carry two packs
+    // @Field: Volt: Mean pack voltage
+    // @Field: Curr: Total current, discharge positive
+    // @Field: SOC: Mean state of charge
+    // @Field: Temp: Highest pack temperature
+    // @Field: SDV: Standard deviation of pack voltage
+    // @Field: SDA: Standard deviation of pack current
+    // @Field: SDS: Standard deviation of pack state of charge
+    // @Field: Alm: Vendor alarm bitmask, unioned
+    // @Field: Warn: Vendor warning bitmask, unioned
+    AP::logger().WriteStreaming(
+        "ZBMS", "TimeUS,Np,Dup,Volt,Curr,SOC,Temp,SDV,SDA,SDS,Alm,Warn",
+        "s##vA%OvA---", "F00000000000", "QBBffBffffHH",
+        now_us,
+        live,
+        uint8_t(_dup_any ? 1 : 0),
+        (double)_state.voltage,
+        (double)_state.current_amps,
+        _soc_pct,
+        (double)_state.temperature,
+        (double)_sd_voltage,
+        (double)_sd_current,
+        (double)_sd_soc,
+        _alarm_bits,
+        _warning_bits);
+
+    // @LoggerMessage: ZBND
+    // @Description: Zhiann BMS per-node readings behind the aggregate
+    // @Field: TimeUS: Time since system startup
+    // @Field: Node: Proprietary broadcast node
+    // @Field: Volt: Pack voltage
+    // @Field: Curr: Pack current, discharge positive
+    // @Field: SOC: Pack state of charge
+    // @Field: Temp: Pack temperature
+    // @Field: Dup: This node appears to carry two packs
+    // @Field: ID: Per-pack identity from the 2s frame
+    for (uint8_t node = 0; node < ARRAY_SIZE(_nodes); node++) {
+        Node &n = _nodes[node];
+        if (!ZhiannBMS::fresh_ms(now_ms, n.last_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            continue;
+        }
+        AP::logger().WriteStreaming(
+            "ZBND", "TimeUS,Node,Volt,Curr,SOC,Temp,Dup,ID",
+            "s#vA%O#-", "F0000000", "QBffBfBI",
+            now_us,
+            node,
+            (double)n.voltage,
+            (double)n.current,
+            uint8_t(n.soc_tenths / 10),
+            (double)n.temperature,
+            uint8_t(n.dup.active(now_ms) ? 1 : 0),
+            n.pack_id);
+
+        // Full cell set per pack. MAVLink carries only 14 cells and the
+        // aggregate averages them away, so this is the only place a single
+        // failing cell in a single pack can be seen after the fact.
+        if (n.cell_count != 24 ||
+            !ZhiannBMS::fresh_ms(now_ms, n.cells_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            continue;
+        }
+        // @LoggerMessage: ZBC1
+        // @Description: Zhiann BMS cells 1-12 for one pack
+        // @Field: TimeUS: Time since system startup
+        // @Field: Node: Proprietary broadcast node
+        // @Field: V1: Cell 1 voltage
+        // @Field: V2: Cell 2 voltage
+        // @Field: V3: Cell 3 voltage
+        // @Field: V4: Cell 4 voltage
+        // @Field: V5: Cell 5 voltage
+        // @Field: V6: Cell 6 voltage
+        // @Field: V7: Cell 7 voltage
+        // @Field: V8: Cell 8 voltage
+        // @Field: V9: Cell 9 voltage
+        // @Field: V10: Cell 10 voltage
+        // @Field: V11: Cell 11 voltage
+        // @Field: V12: Cell 12 voltage
+        AP::logger().WriteStreaming(
+            "ZBC1", "TimeUS,Node,V1,V2,V3,V4,V5,V6,V7,V8,V9,V10,V11,V12",
+            "s#vvvvvvvvvvvv", "F0CCCCCCCCCCCC", "QBHHHHHHHHHHHH",
+            now_us, node,
+            n.cells[0], n.cells[1], n.cells[2], n.cells[3],
+            n.cells[4], n.cells[5], n.cells[6], n.cells[7],
+            n.cells[8], n.cells[9], n.cells[10], n.cells[11]);
+
+        // @LoggerMessage: ZBC2
+        // @Description: Zhiann BMS cells 13-24 for one pack
+        // @Field: TimeUS: Time since system startup
+        // @Field: Node: Proprietary broadcast node
+        // @Field: V13: Cell 13 voltage
+        // @Field: V14: Cell 14 voltage
+        // @Field: V15: Cell 15 voltage
+        // @Field: V16: Cell 16 voltage
+        // @Field: V17: Cell 17 voltage
+        // @Field: V18: Cell 18 voltage
+        // @Field: V19: Cell 19 voltage
+        // @Field: V20: Cell 20 voltage
+        // @Field: V21: Cell 21 voltage
+        // @Field: V22: Cell 22 voltage
+        // @Field: V23: Cell 23 voltage
+        // @Field: V24: Cell 24 voltage
+        AP::logger().WriteStreaming(
+            "ZBC2", "TimeUS,Node,V13,V14,V15,V16,V17,V18,V19,V20,V21,V22,V23,V24",
+            "s#vvvvvvvvvvvv", "F0CCCCCCCCCCCC", "QBHHHHHHHHHHHH",
+            now_us, node,
+            n.cells[12], n.cells[13], n.cells[14], n.cells[15],
+            n.cells[16], n.cells[17], n.cells[18], n.cells[19],
+            n.cells[20], n.cells[21], n.cells[22], n.cells[23]);
+    }
+#endif  // HAL_LOGGING_ENABLED
 }
 
 #endif  // AP_BATTERY_ZHIANNBMS_ENABLED

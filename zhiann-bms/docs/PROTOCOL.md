@@ -152,10 +152,12 @@ claim node 2 (fleet: 100%→n0, 96%→n1, 44%+42%→n2, n3 empty). Findings:
   5 (SW v2.01.0003), 6 (SW date 2025-07-10), 7 (proto v1.14) respond.
   No CAN_IDX / node-index setting exposed, so no settings-write fix.
 - CONCLUSIVE (2026-07-22): fw 2.01.0003 NEVER re-arbitrates persisted node claims: synchronized boot, staggered off-bus boot, hot-rejoin, cold-boot-on-live-bus-with-node-occupied, PF 0x07 with/without heartbeats, 2-pack membership boots ALL fail. The ONLY event that ever rewrote persisted claims was a pack BOOTING while master heartbeats were active (the incident: packs rebooted under bitmap 0x07 and adopted registered nodes 0,1,2 persistently - bitmap appears to act as the allowed-node set at boot). Untested final option: single-pack surgical rewrite = only the misclaimed pack on the bus + Nucleo heartbeating bitmap 0x08 (only node 3 registered) + power-cycle the pack, expect it to adopt node 3 persistently.
-- Safe conclusion otherwise: needs the VENDOR (config tool, supplementary protocol
-  doc for the drone profile, or firmware fix). System is failsafe
-  meanwhile: the contested node feeds one ArduPilot instance interleaved
-  data and the empty node keeps one instance unhealthy -> arming blocked.
+- Safe conclusion otherwise: needs the VENDOR (config tool, supplementary
+  protocol doc for the drone profile, or firmware fix). This stopped being an
+  operational problem on 2026-08-14, when the ArduPilot driver moved to
+  publishing the whole set as one battery: a collision just means one node
+  carrying two packs' frames, which the aggregate absorbs. It is reported to
+  the operator and no longer blocks anything.
 
 ## Vendor + node-arbitration algorithm (research, 2026-07-22)
 
@@ -262,5 +264,6 @@ identical for every pack, so it is a fixed announce, not a unique id.
 
 - ArduPilot driver: `AP_BattMonitor_ZhiannBMS` on branch
   `Copter-4.6.3-zhiann-bms` of the fork (BATT_MONITOR=30,
-  CAN_Dx_PROTOCOL=15), nodes 0-15 via BATTn_SERIAL_NUM or -1 auto-bind.
+  CAN_Dx_PROTOCOL=15). Consumes every node 0-15 and publishes the set as a
+  single battery; no node-to-instance mapping.
 - Host decoder: `can_bms/can_sniffer/scripts/decode.py`.

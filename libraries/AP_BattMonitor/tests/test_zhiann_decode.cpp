@@ -153,8 +153,6 @@ TEST(ZhiannDecode, soc_coarse_frame)
     uint8_t d[8]; hex2bytes("2C00806E11000000", d);
     EXPECT_EQ(soc_coarse_pct(d), 44);
     EXPECT_NEAR(soc_voltage_mirror(d) / 320.0f, 88.4f, 0.05f);
-    EXPECT_TRUE(pack_vmir_coherent(88.4f, soc_voltage_mirror(d), 1.0f));
-    EXPECT_FALSE(pack_vmir_coherent(100.0f, soc_voltage_mirror(d), 1.0f));
 }
 
 TEST(ZhiannDecode, soc_coarse_masks_status_bits)
@@ -238,61 +236,10 @@ TEST(ZhiannDecode, cell_snapshot_is_atomic_and_validates_count)
     EXPECT_FALSE(accumulator.feed(FRAME_CELL_3_6, four_cells, now_ms, 250));
 }
 
-TEST(ZhiannDecode, consumed_capacity_from_soc)
-{
-    EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 1000), 0.0f, 0.01f);
-    EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 440), 24640.0f, 0.01f);
-    EXPECT_NEAR(consumed_mah_from_soc(44000.0f, 0), 44000.0f, 0.01f);
-    // SOC-derived consumption may raise but never erase the
-    // calibrated-current integral.
-    EXPECT_NEAR(reconciled_consumed_mah(0, 44000.0f, 440),
-                24640.0f, 0.01f);
-    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 500),
-                25000.0f, 0.01f);
-    EXPECT_NEAR(reconciled_consumed_mah(25000.0f, 44000.0f, 400),
-                26400.0f, 0.01f);
-}
-
-TEST(ZhiannDecode, consumed_floor_survives_session_reseed)
-{
-    // boot: seeded from SOC 44.0% on a 44Ah pack
-    float consumed = reconciled_consumed_mah(0.0f, 44000.0f, 440);
-    EXPECT_NEAR(consumed, 24640.0f, 0.01f);
-    // current integration continues past the SOC-derived floor
-    consumed += 1500.0f;
-    // a BMS outage resets the session; the first SOC afterwards reads
-    // higher (noise/recovery) - re-seeding must never move consumption down
-    EXPECT_NEAR(reconciled_consumed_mah(consumed, 44000.0f, 450),
-                consumed, 0.01f);
-    // while a genuinely lower SOC still raises the floor
-    EXPECT_NEAR(reconciled_consumed_mah(consumed, 44000.0f, 300),
-                30800.0f, 0.01f);
-}
-
 TEST(ZhiannDecode, invalid_soc_is_rejected)
 {
     uint8_t fine[8]; hex2bytes("00000000E9030000", fine); // 100.1%
     EXPECT_FALSE(soc_fine_valid(fine));
-}
-
-TEST(ZhiannDecode, cell_sum_coherence_detects_collision_mix)
-{
-    uint16_t cells[24];
-    for (uint8_t i = 0; i < 24; i++) {
-        cells[i] = 4265;
-    }
-    // Approximate real collision sequence: 88.89V PACK followed by cells
-    // from a ~102.36V pack on the same node.
-    EXPECT_FALSE(pack_cells_coherent(88.89f, cells, 24, 1.0f));
-    EXPECT_TRUE(pack_cells_coherent(102.36f, cells, 24, 1.0f));
-    cells[0] = UINT16_MAX;
-    EXPECT_FALSE(pack_cells_coherent(102.36f, cells, 24, 1.0f));
-    // An impossible individual cell must not hide behind a plausible sum.
-    cells[0] = 60000;
-    for (uint8_t i = 1; i < 24; i++) {
-        cells[i] = 1739;
-    }
-    EXPECT_FALSE(pack_cells_coherent(100.0f, cells, 24, 1.0f));
 }
 
 TEST(ZhiannDecode, cell_frames)
@@ -325,175 +272,6 @@ TEST(ZhiannDecode, cell_map_covers_24)
     for (uint8_t i = 0; i < 24; i++) {
         EXPECT_TRUE(seen[i]);
     }
-}
-
-TEST(ZhiannDecode, dup_detector)
-{
-    DupDetector det;
-    uint32_t t = 1000;
-    // healthy single pack: ~500ms spacing, never trips
-    for (int i = 0; i < 40; i++) {
-        det.feed(t); t += 500;
-        EXPECT_FALSE(det.active());
-    }
-    EXPECT_TRUE(det.qualified());
-    // two packs collide (real timing from the node-2 collision captures:
-    // alternating ~200/300ms gaps): trips within a few seconds
-    for (int i = 0; i < 12; i++) {
-        det.feed(t); t += (i % 2) ? 200 : 300;
-    }
-    EXPECT_TRUE(det.active());
-    EXPECT_FALSE(det.qualified());
-    // collision resolved: recovers
-    for (int i = 0; i < 40; i++) {
-        det.feed(t); t += 500;
-    }
-    EXPECT_FALSE(det.active());
-    EXPECT_TRUE(det.qualified());
-
-    det.reset_qualification();
-    EXPECT_FALSE(det.qualified());
-
-}
-
-TEST(ZhiannDecode, dup_detector_ignores_startup_burst)
-{
-    // Regression for the bench false positive of 2026-08-14: the first of four
-    // packs to power on emitted a burst of PACK_VOLT frames on an otherwise
-    // quiet bus, tripping a duplicate on node 0 within one second and holding
-    // it 9.5s. A single pack runs at 508ms, and spacing this tight is a
-    // startup burst or queue drain, never a collision.
-    DupDetector d;
-    uint32_t t = 1000;
-    for (int i = 0; i < 200; i++) { t += 4; d.feed(t); }
-    EXPECT_FALSE(d.active());
-    for (int i = 0; i < 50; i++) { t += 19; d.feed(t); }   // largest drain gap
-    EXPECT_FALSE(d.active());
-    // A genuine collision is still caught. Two packs do NOT split the period
-    // evenly: they hold a locked phase offset, so the stream alternates a
-    // short gap with a long one. 40/468 is the corpus median for both packs
-    // that collided on 2026-08-13, and 36ms is the smallest short gap seen -
-    // only 16ms above the floor above.
-    for (int i = 0; i < 10; i++) { t += 40; d.feed(t); t += 468; d.feed(t); }
-    EXPECT_TRUE(d.active());
-    // and a single pack clears it again
-    for (int i = 0; i < 30; i++) { t += 508; d.feed(t); }
-    EXPECT_FALSE(d.active());
-}
-
-TEST(ZhiannDecode, coherence_detector_holds_until_clean_run)
-{
-    CoherenceDetector detector;
-    EXPECT_FALSE(detector.active());
-    detector.feed_vmir(false);
-    EXPECT_FALSE(detector.active());    // a single hit only arms a strike
-    detector.feed_vmir(false);
-    EXPECT_TRUE(detector.active());     // second consecutive hit activates
-    for (uint8_t i = 0; i < 19; i++) {
-        detector.feed_vmir(true);
-        EXPECT_TRUE(detector.active());
-    }
-    detector.feed_vmir(true);
-    EXPECT_FALSE(detector.active());
-}
-
-TEST(ZhiannDecode, coherence_requires_consecutive_mismatches)
-{
-    CoherenceDetector detector;
-    // isolated mismatches separated by clean checks never activate: a
-    // boundary sample or bus glitch is not collision evidence on its own
-    for (uint8_t i = 0; i < 6; i++) {
-        detector.feed_cellsum(false);
-        EXPECT_FALSE(detector.active());
-        detector.feed_cellsum(true);
-        EXPECT_FALSE(detector.active());
-    }
-    // two consecutive mismatches of the same kind activate the fault
-    detector.feed_cellsum(false);
-    detector.feed_cellsum(false);
-    EXPECT_TRUE(detector.active());
-}
-
-TEST(ZhiannDecode, coherence_streams_have_separate_strikes)
-{
-    CoherenceDetector detector;
-    // one physical transient (a load step straddling a burst) can hit the
-    // voltage-mirror and cell-sum checks once each within 500ms; a single
-    // strike per stream is not two of a kind and must not activate
-    detector.feed_vmir(false);
-    detector.feed_cellsum(false);
-    EXPECT_FALSE(detector.active());
-    detector.feed_vmir(true);
-    detector.feed_cellsum(true);
-    EXPECT_FALSE(detector.active());
-    // while two consecutive mismatches on one stream activate, even with
-    // the other stream's clean evidence interleaved
-    detector.feed_vmir(false);
-    detector.feed_cellsum(true);
-    detector.feed_vmir(false);
-    EXPECT_TRUE(detector.active());
-}
-
-TEST(ZhiannDecode, coherence_session_boundary_clears_strikes_not_score)
-{
-    CoherenceDetector detector;
-    // a >5s outage invalidates a half-armed strike: the first mismatch of
-    // the new session must not pair with pre-outage evidence
-    detector.feed_vmir(false);
-    detector.clear_pending();
-    detector.feed_vmir(false);
-    EXPECT_FALSE(detector.active());
-    // but an accumulated active score is preserved across the boundary
-    detector.feed_vmir(false);
-    EXPECT_TRUE(detector.active());
-    detector.clear_pending();
-    EXPECT_TRUE(detector.active());
-}
-
-TEST(ZhiannDecode, coherent_window_tolerates_single_bad_generation)
-{
-    // Driver semantics: cell publication and health key off the last
-    // COHERENT complete snapshot staying fresh within the 5s battery
-    // timeout. An incoherent generation never advances the timestamp (its
-    // cells are dropped, it only feeds the detector), yet one bad 500ms
-    // generation leaves the window fresh; only sustained incoherence or
-    // silence stales it.
-    const uint32_t last_coherent_ms = 10000;
-    // the next (incoherent) generation does not stale the window
-    EXPECT_TRUE(fresh_ms(10500, last_coherent_ms, 5000));
-    // sustained incoherence fails once the 5s window is exceeded
-    EXPECT_TRUE(fresh_ms(15000, last_coherent_ms, 5000));
-    EXPECT_FALSE(fresh_ms(15001, last_coherent_ms, 5000));
-}
-
-TEST(ZhiannDecode, dup_detector_tolerates_lost_frames)
-{
-    DupDetector det;
-    uint32_t t = 1000;
-    det.feed(t);
-    // four clean ~500ms intervals: one short of qualification
-    for (int i = 0; i < 4; i++) {
-        t += 500; det.feed(t);
-    }
-    EXPECT_FALSE(det.qualified());
-    // a single lost frame (~1s gap) is neutral: no reset, no credit
-    t += 1000; det.feed(t);
-    EXPECT_FALSE(det.qualified());
-    // so are up to ~3 lost frames: long gaps are never a collision
-    // signature, so they must not restart qualification
-    t += 1500; det.feed(t);
-    EXPECT_FALSE(det.qualified());
-    // the fifth clean interval completes qualification
-    t += 500; det.feed(t);
-    EXPECT_TRUE(det.qualified());
-    EXPECT_FALSE(det.active());
-
-    // a 1500ms gap after qualification is equally neutral
-    t += 1500; det.feed(t);
-    EXPECT_TRUE(det.qualified());
-    // a gap beyond the neutral window (>1800ms) resets qualification
-    t += 1900; det.feed(t);
-    EXPECT_FALSE(det.qualified());
 }
 
 TEST(ZhiannDecode, pack_volt_partial_validation)
@@ -692,6 +470,38 @@ TEST(ZhiannDecode, soc_cadence_tolerates_dropped_frames)
     t += 402;               // two missed frames on a collided node
     d.feed(t);
     EXPECT_TRUE(d.active(t));
+}
+
+TEST(ZhiannDecode, stdev_of_pack_spread)
+{
+    // no spread to speak of: a single pack, and identical packs
+    EXPECT_FLOAT_EQ(stdev(102.5f, 102.5f * 102.5f, 1), 0.0f);
+    float sum = 0, sum_sq = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        sum += 100.0f;
+        sum_sq += 100.0f * 100.0f;
+    }
+    // identical values: the variance subtraction must not go negative and
+    // produce a NaN through sqrtf
+    EXPECT_FLOAT_EQ(stdev(sum, sum_sq, 4), 0.0f);
+
+    // the four packs measured on the bench 2026-08-14
+    const float v[] = { 102.09f, 102.38f, 102.58f, 102.93f };
+    sum = 0; sum_sq = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        sum += v[i];
+        sum_sq += v[i] * v[i];
+    }
+    EXPECT_NEAR(stdev(sum, sum_sq, 4), 0.303f, 0.005f);
+
+    // one pack collapsed: the spread is what the operator needs to see
+    const float bad[] = { 102.09f, 102.38f, 102.58f, 88.0f };
+    sum = 0; sum_sq = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        sum += bad[i];
+        sum_sq += bad[i] * bad[i];
+    }
+    EXPECT_GT(stdev(sum, sum_sq, 4), 6.0f);
 }
 
 AP_GTEST_MAIN()

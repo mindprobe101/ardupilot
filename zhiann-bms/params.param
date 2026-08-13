@@ -1,0 +1,17 @@
+# Zhiann BMS: the whole pack set published as one battery.
+#
+# The driver consumes every node on the bus and reduces the set to a single
+# battery, so this is the same file whether you fly two packs or five, and a
+# node collision does not change it either.
+#
+# Set LOW/CRT voltage thresholds and the failsafe actions for the airframe
+# before flight; this file deliberately does not invent safety limits.
+CAN_P2_DRIVER,2
+CAN_D2_PROTOCOL,15
+BATT_MONITOR,30
+# Pack count is discovered at runtime, so the set has no fixed mAh capacity.
+# Use voltage-based failsafes and leave capacity at zero.
+BATT_CAPACITY,0
+BATT_LOW_MAH,0
+BATT_CRT_MAH,0
+BATT_ARM_MAH,0

@@ -58,8 +58,15 @@ Validation date: 2026-07-22. Reviewed base: ArduCopter 4.6.3 branch commit
 
 - Configure protocol 15 on exactly one CAN driver; additional matching ports
   are ignored by `CANSensor`.
-- `BATTn_SERIAL_NUM` accepts only `-1` or `0..15` and is snapshotted at boot;
-  reboot after changes.
-- Invalid/duplicate mappings fail safe as unhealthy but diagnostics are generic.
-- The current scale is nominal, alarms remain unbenchmarked, and 304 bytes of
-  flash headroom is not suitable for unreviewed feature growth.
+- Configure exactly one instance with `BATT_MONITOR=30`; a second instance of
+  this type would publish a duplicate of the same battery and is held
+  unhealthy instead.
+- Pack count is discovered at runtime, so the set has no fixed mAh capacity.
+  Leave `BATT_CAPACITY` at 0 and use voltage-based failsafes.
+- Alarms remain unbenchmarked, and flash headroom is tight enough that it must
+  be rechecked on every rebuild rather than assumed.
+- The 1 mA/LSB current scale has not been confirmed under load on the aircraft.
+  Bench runs on 2026-08-14 had all four packs idle, where the BMS reports
+  exactly 0 A, so the scale is still supported only by the pack's own rated
+  capacity and coulomb counting. Confirm it against a load before relying on
+  consumed-mAh figures.
