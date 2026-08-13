@@ -20,16 +20,20 @@
     +0x05  cell voltages 11..14 (mV)
     +0x06  cell voltages 15..18 (mV)
     +0x09  cell voltages 23..24 (mV)
-    +0x10  counter/crc, pack voltage (10 mV), current (s32, 2 mA,
+    +0x10  counter/crc, pack voltage (10 mV), current (s32, 1 mA,
            negative = discharge, reads 0 below a few amps)
 
   0x401A100+n: SOC (%), pack voltage mirror (1/320 V), temperature?
-  0x402A100: single transmitter on the bus, unused here.
+    Emitted by every pack on its own node; its cadence doubles when two
+    packs share a node, which is the primary duplicate-node signal.
+  0x402A100+n: 2 s frame carrying a per-pack identity in bytes 4..7. Not
+    every occupied node emits it and the rule is not known, so it can name
+    the packs involved in a collision but cannot detect one on its own.
 
-  The pack block repeats every ~500 ms. The nominal current scale was
-  calibrated against an ArduPilot analog power module (steady-load
-  plateaus 13..48 A gave 2.05 +/- 0.05 mA/LSB -> 2 mA nominal); use
-  BATTn_CURR_MULT to trim in the field.
+  The pack block repeats every ~500 ms. Current is 1 mA/LSB: the pack
+  broadcasts its own 44.0 Ah rated capacity, and coulomb-counting flights
+  against the packs' own SOC agrees with that scale. Use BATTn_CURR_MULT to
+  trim in the field.
 
   Instance selection: set BATTn_SERIAL_NUM to the pack node (0..15), or
   leave -1 to bind to the first pack not claimed by any other instance.
@@ -106,6 +110,11 @@ static const struct {
 // above 1V in the corpus came from a known duplicate-node collision.
 #define ZHIANN_CELL_SUM_TOLERANCE_V  1.0f
 
+// Longest a coherence fault alone may hold health down. Must stay clear of
+// AP_BATT_MONITOR_TIMEOUT (5s), after which ArduPilot raises a battery
+// failsafe that latches for the remainder of the flight.
+#define ZHIANN_COHERENCE_HOLD_MS  3000
+
 // Across 35,613 complete captured bursts, all seven slices span 22..55ms.
 // This margin tolerates bus/scheduler jitter but rejects a set assembled
 // from different nominal 500ms generations after a slice is lost.
@@ -115,7 +124,7 @@ const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 
     // @Param: CURR_MULT
     // @DisplayName: Scales reported power monitor current
-    // @Description: Multiplier applied to the BMS reported current, to trim the nominal 2mA/LSB scale against a calibrated reference
+    // @Description: Multiplier applied to the BMS reported current, to trim the nominal 1mA/LSB scale against a calibrated reference
     // @Range: .1 10
     // @User: Advanced
     AP_GROUPINFO("CURR_MULT", 30, AP_BattMonitor_ZhiannBMS, _curr_mult, 1.0),
@@ -293,6 +302,25 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
     return false;
 }
 
+// Name the two packs when the identity frame can see them, so the operator
+// knows which to physically separate; guessing which two cost a day of
+// operations on 2026-08-13. Not every occupied node emits the identity frame,
+// and most collided nodes do not, so fall back to the node number alone.
+void AP_BattMonitor_ZhiannBMS::warn_duplicate(uint32_t now_ms)
+{
+    if (_identity_dup.active(now_ms)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "ZhiannBMS: duplicate node %d: %08X+%08X",
+                      int(bound_node()),
+                      unsigned(_identity_dup.id_a()),
+                      unsigned(_identity_dup.id_b()));
+    } else {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                      "ZhiannBMS: duplicate pack on node %d",
+                      int(bound_node()));
+    }
+}
+
 void AP_BattMonitor_ZhiannBMS::note_unmapped(uint32_t now_ms)
 {
     WITH_SEMAPHORE(_sem);
@@ -402,10 +430,24 @@ void AP_BattMonitor_ZhiannBMS::handle_pack_frame(uint8_t frame_type, AP_HAL::CAN
         }
         break;
 
+    case ZhiannBMS::FRAME_PACK_ID:
+        // 2s identity frame. Deliberately does NOT refresh _last_frame_us:
+        // it flows in standby too, so treating it as liveness would make a
+        // switched-off pack look like a live one. A lone pack repeats one
+        // id forever; two packs sharing the node alternate between theirs,
+        // which is a duplicate signal needing no timing heuristics and
+        // available before the packs are even switched on.
+        _pack_id = ZhiannBMS::pack_id(frame.data);
+        _identity_dup.feed(_pack_id, AP_HAL::millis());
+        break;
+
     case ZhiannBMS::FRAME_SOC_COARSE:
         // this frame keeps flowing in pack standby, when the detail
         // frames stop: it distinguishes standby from gone-from-bus
         _last_soc_ms = AP_HAL::millis();
+        // every pack emits this on its own node, so its cadence is the
+        // primary duplicate signal and works before the packs are on
+        _soc_dup.feed(_last_soc_ms);
         _soc_frame_vmir = ZhiannBMS::soc_voltage_mirror(frame.data);
         // compare only against a recent (<=500ms) pack-voltage sample: an
         // older one may straddle a load step and fake a mismatch
@@ -581,6 +623,25 @@ void AP_BattMonitor_ZhiannBMS::read()
     const uint64_t tnow_us = AP_HAL::micros64();
     const uint32_t now_ms = AP_HAL::millis();
 
+    // Liveness for this instance, latched for the session. Must be set on
+    // EVERY path, not just the outage branch: the FC is powered from the
+    // packs, so frames are already arriving before the first read() and a
+    // healthy instance would otherwise never record that it was ever heard.
+    // The unbound-instance warning below counts peers by this flag.
+    if (_last_frame_us != 0 || _last_soc_ms != 0) {
+        _ever_heard = true;
+    }
+
+    // Arming restarts the coherence hold window, so the cap always measures
+    // how long a fault has been gating health IN FLIGHT. Without this a
+    // fault carried in from the ground is already past the cap at the arm
+    // instant and contributes nothing for the whole flight.
+    const bool armed = hal.util->get_soft_armed();
+    if (armed && !_was_armed) {
+        _coherence_since_ms = 0;
+    }
+    _was_armed = armed;
+
     // Expire fault telemetry even when detail traffic has stopped.
     if (_alarm_ms != 0 &&
         !ZhiannBMS::fresh_ms(now_ms, _alarm_ms, AP_BATT_MONITOR_TIMEOUT)) {
@@ -663,7 +724,20 @@ void AP_BattMonitor_ZhiannBMS::read()
         _has_cell_voltages = false;
         _has_temperature = false;
         _coherence_fault = false;
-        _dup_active = false;
+        _coherence_since_ms = 0;
+        // The cadence detector needs detail frames, so it cannot speak here.
+        // The identity frame keeps flowing in standby, so a duplicate node is
+        // still detectable — and this is the most useful moment to say so,
+        // before the packs are switched on and anyone tries to arm.
+        // Neither _soc_dup nor _identity_dup is reset here: both are fed from
+        // frames that keep flowing in standby, and clearing them would blind
+        // exactly the case this branch exists to report.
+        _dup_active = _soc_dup.active(now_ms) || _identity_dup.active(now_ms);
+        if (_dup_active &&
+            (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
+            _dup_warn_ms = now_ms;
+            warn_duplicate(now_ms);
+        }
         _dup.reset_qualification();
         _soc_valid = false;
         _soc_valid_ms = 0;
@@ -701,6 +775,42 @@ void AP_BattMonitor_ZhiannBMS::read()
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                           "ZhiannBMS: pack on node %d in standby",
                           int(bound_node()));
+        }
+
+        // A configured instance that never binds while other packs are live
+        // is a configuration mismatch, not a failed pack. ArduPilot surfaces
+        // it as "Battery N is missing, last: 0.00V", which reads like a dead
+        // battery; on 2026-08-13 four instances were configured against three
+        // distinct nodes (two packs had collided) and that message sent the
+        // crew hunting a hardware fault for a day.
+        //
+        // Keyed on LIVENESS, not on bound_node(): an instance with an
+        // explicit BATTn_SERIAL_NUM reports a bound node whether or not any
+        // pack was ever heard there, so a bound-node test would never fire in
+        // the primary documented configuration. _ever_heard is set at the top
+        // of read() on every path; the peer reads below are main-thread-only
+        // values also written under read().
+        if (!_ever_heard &&
+            (_unbound_warn_ms == 0 || now_ms - _unbound_warn_ms >= 30000)) {
+            uint8_t live = 0;
+            for (uint8_t i = 0; i < _num_instances; i++) {
+                if (_instances[i] != this && _instances[i]->_ever_heard) {
+                    live++;
+                }
+            }
+            if (live > 0) {
+                _unbound_warn_ms = now_ms;
+                // parameter-name suffix: BATT_ for instance 0, BATT2_ beyond
+                // (same convention as announce_misconfiguration())
+                char pfx[3] {};
+                if (_state.instance > 0) {
+                    hal.util->snprintf(pfx, sizeof(pfx), "%X",
+                                       unsigned(_state.instance + 1));
+                }
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
+                              "ZhiannBMS: BATT%s configured, only %u pack%s on bus",
+                              pfx, unsigned(live), live == 1 ? "" : "s");
+            }
         }
         log_zbms();
         return;
@@ -757,13 +867,50 @@ void AP_BattMonitor_ZhiannBMS::read()
     _coherence_fault = _coherence_detector.active();
     _has_cell_voltages = cell_snapshot_valid;
     if (_coherence_fault) {
-        _state.healthy = false;
+        if (_coherence_since_ms == 0) {
+            _coherence_since_ms = now_ms;
+        }
+        // Bound how long coherence alone may hold health down. ArduPilot
+        // raises Failsafe::Unhealthy after 5s without a healthy reading, and
+        // in Copter that failsafe LATCHES for the rest of the flight: buzzer
+        // throughout, "Bad Battery" on the HUD, re-arm blocked until reboot.
+        // A PSC_ACCZ tuning oscillation on 2026-07-24 produced a 5.6s trip
+        // and did exactly that with the packs healthy throughout (cell
+        // spread 7-19mV either side). The fault is measurement skew: the
+        // 24-cell snapshot spans up to 250ms of frames while PACK voltage is
+        // a different instant, so a fast load step makes them disagree.
+        // Keep reporting it, but stop gating health past the cap so a
+        // transient can never latch a failsafe in flight.
+        //
+        // The cap applies ONLY while armed. On the ground the pre-arm gate
+        // stays absolute: arming_checks() keys directly off healthy(), and a
+        // sustained disagreement between two independent voltage sources
+        // must keep blocking arming for as long as it lasts. Relaxing that
+        // was never the goal, and the coherence detector only clears its
+        // score on a coherent check, so a persistent fault would otherwise
+        // stop gating health permanently after the first 3s.
+        //
+        // The cap bounds THIS gate only. Incoherent generations are never
+        // committed, so _last_coherent_snapshot_ms stops advancing and the
+        // cell-freshness gate below independently fails health from 5s
+        // onward. Health therefore goes false 0-3s, true 3-5s (which
+        // refreshes ArduPilot's last_healthy_ms and disarms the pending
+        // failsafe), then false again from 5s. The net effect is that a
+        // coherence fault shorter than ~10s cannot latch a failsafe, which
+        // covers the 5.6s event above; a fault sustained beyond that still
+        // latches, deliberately, because 24 cells that have not agreed with
+        // pack voltage for ten seconds are not a battery worth trusting.
+        if (!armed || now_ms - _coherence_since_ms < ZHIANN_COHERENCE_HOLD_MS) {
+            _state.healthy = false;
+        }
         if (_coherence_warn_ms == 0 || now_ms - _coherence_warn_ms >= 30000) {
             _coherence_warn_ms = now_ms;
             GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                           "ZhiannBMS: incoherent data on node %d",
                           int(bound_node()));
         }
+    } else {
+        _coherence_since_ms = 0;
     }
 
     // A PACK frame alone is not a coherent battery snapshot. Do not permit
@@ -776,17 +923,19 @@ void AP_BattMonitor_ZhiannBMS::read()
     // two packs sharing this node interleave their data: readings are a
     // physically meaningless mixture, so report unhealthy and tell the
     // operator why (hysteresis inside the detector stops flapping)
-    _dup_active = _dup.active();
+    // Three signals, any of which means duplicate:
+    //  - SOC-coarse cadence: primary, every pack emits it on its own node
+    //  - PACK_VOLT cadence: the original detector, detail frames only
+    //  - identity: seen on some nodes only, but names the packs when present
+    const bool identity_dup = _identity_dup.active(now_ms);
+    _dup_active = _soc_dup.active(now_ms) || _dup.active() || identity_dup;
     if (_dup_active || !_dup.qualified()) {
         _state.healthy = false;
     }
-    if (_dup_active) {
-        if (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000) {
-            _dup_warn_ms = now_ms;
-            GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
-                          "ZhiannBMS: duplicate pack on node %d",
-                          int(bound_node()));
-        }
+    if (_dup_active &&
+        (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
+        _dup_warn_ms = now_ms;
+        warn_duplicate(now_ms);
     }
 
     log_zbms();
@@ -800,7 +949,11 @@ void AP_BattMonitor_ZhiannBMS::log_zbms()
 {
 #if HAL_LOGGING_ENABLED
     const uint32_t now_ms = AP_HAL::millis();
-    if (_last_frame_us == 0 || now_ms - _last_log_ms < 500) {
+    // Gated on liveness, not on PACK_VOLT: a pack that has only ever been in
+    // standby emits SOC frames and no detail frames, and its duplicate and
+    // identity state is exactly what post-flight analysis needs. An instance
+    // that has never heard anything still logs nothing.
+    if (!_ever_heard || now_ms - _last_log_ms < 500) {
         return;
     }
     _last_log_ms = now_ms;
@@ -816,11 +969,16 @@ void AP_BattMonitor_ZhiannBMS::log_zbms()
                           (_coherence_fault ? 64U : 0) |
                           (_current_fault ? 128U : 0);
     const uint64_t now_us = AP_HAL::micros64();
-    const uint64_t age_ms_64 = (now_us - _last_frame_us) / 1000ULL;
+    // a pack that has only ever been in standby has no PACK_VOLT frame, but
+    // its duplicate/identity state is exactly what post-flight analysis needs
+    const uint64_t age_ms_64 = _last_frame_us == 0 ? UINT16_MAX :
+                               (now_us - _last_frame_us) / 1000ULL;
     const uint16_t age_ms = age_ms_64 > UINT16_MAX ? UINT16_MAX :
                             uint16_t(age_ms_64);
 
-    static_assert(sizeof("TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vmir,NCel,Age") <= LS_LABELS_SIZE,
+    // Labels are at the dataflash schema limit, so Vm/NC are abbreviated to
+    // make room for the pack id (was Vmir/NCel before 2026-08-14).
+    static_assert(sizeof("TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vm,NC,Age,ID") <= LS_LABELS_SIZE,
                   "ZBMS labels exceed dataflash schema limit");
     // @LoggerMessage: ZBMS
     // @Description: Zhiann BMS pack status
@@ -835,13 +993,14 @@ void AP_BattMonitor_ZhiannBMS::log_zbms()
     // @Field: T2: Temperature sensor 2
     // @Field: Alm: Vendor alarm bitmask
     // @Field: Warn: Vendor warning bitmask
-    // @Field: Vmir: Raw SOC-frame voltage mirror, in 1/320 volt
-    // @Field: NCel: Reported cell count
+    // @Field: Vm: Raw SOC-frame voltage mirror, in 1/320 volt
+    // @Field: NC: Reported cell count
     // @Field: Age: Milliseconds since the last valid pack frame
+    // @Field: ID: Per-pack identity from the 2s frame; identifies which physical pack is on this node
     AP::logger().WriteStreaming(
-        "ZBMS", "TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vmir,NCel,Age",
-        "s#--vA%OO-----", "F---00000-----",
-        "QBbBffBffHHHBH",
+        "ZBMS", "TimeUS,Inst,Node,Flag,Volt,Curr,SOC,T1,T2,Alm,Warn,Vm,NC,Age,ID",
+        "s#--vA%OO------", "F---00000------",
+        "QBbBffBffHHHBHI",
         now_us,
         _state.instance,
         (int8_t)bound_node(),
@@ -855,7 +1014,8 @@ void AP_BattMonitor_ZhiannBMS::log_zbms()
         _warning_bits,
         _soc_frame_vmir,
         _cell_count,
-        age_ms);
+        age_ms,
+        _pack_id);
 
     const uint16_t *c = _cells24;
     // @LoggerMessage: ZBC1

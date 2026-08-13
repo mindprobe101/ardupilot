@@ -41,9 +41,13 @@ TEST(ZhiannDecode, classify_rejects_unknown)
     EXPECT_FALSE(classify(0x2E0958, c));   // type 0x17 unobserved
     // beyond node 15
     EXPECT_FALSE(classify(0x2E0D41, c));
-    // the 2s status frame and the spec heartbeat are not ours to consume
-    EXPECT_FALSE(classify(0x402A100, c));
+    // the spec heartbeat is not ours to consume. (The 2s frame at
+    // 0x402A10n IS consumed since 2026-08-14 for its per-pack identity -
+    // see classify_pack_id_frame.)
     EXPECT_FALSE(classify(0x1843FFF0, c));
+    // adjacent 2s-frame ids outside the node range must still be rejected
+    EXPECT_FALSE(classify(0x402A110, c));
+    EXPECT_FALSE(classify(0x402A0FF, c));
 }
 
 TEST(ZhiannDecode, classify_alarm)
@@ -97,10 +101,11 @@ TEST(ZhiannDecode, pack_volt_idle)
 TEST(ZhiannDecode, pack_volt_under_load)
 {
     // motor load test: raw s32 -23128 (discharge) at 100.31V.
-    // calibrated against the power module: 2 mA/LSB -> +46.256 A
+    // 1 mA/LSB (2026-08-14, from the pack's own 44.0Ah rated capacity and
+    // coulomb counting against its SOC) -> +23.128 A
     uint8_t d[8]; hex2bytes("00002F27A8A5FFFF", d);
     EXPECT_NEAR(pack_voltage(d), 100.31f, 0.001f);
-    EXPECT_NEAR(current_amps(d), 46.256f, 0.001f);
+    EXPECT_NEAR(current_amps(d), 23.128f, 0.001f);
 }
 
 TEST(ZhiannDecode, current_extreme_is_defined)
@@ -495,6 +500,173 @@ TEST(ZhiannDecode, temp_single_sensor_selection)
     EXPECT_NEAR(out, 26.0f, 0.001f);
     // both failed: no update at all
     EXPECT_FALSE(select_temperature(3276.7f, -3276.8f, out));
+}
+
+TEST(ZhiannDecode, classify_pack_id_frame)
+{
+    Classified c {};
+    // 2s identity frame, one per node
+    EXPECT_TRUE(classify(0x402A100, c));
+    EXPECT_EQ(c.node, 0); EXPECT_EQ(c.type, FRAME_PACK_ID);
+    EXPECT_TRUE(classify(0x402A102, c));
+    EXPECT_EQ(c.node, 2); EXPECT_EQ(c.type, FRAME_PACK_ID);
+    EXPECT_EQ(expected_dlc(FRAME_PACK_ID), 8);
+    // real capture: node 2 identity frame of pack FFFFBDBD
+    uint8_t d[8]; hex2bytes("AF040000FFFFBDBD", d);
+    EXPECT_EQ(pack_id(d), 0xFFFFBDBDUL);
+}
+
+TEST(ZhiannDecode, identity_dup_single_pack_never_trips)
+{
+    IdentityDupDetector id;
+    // a lone pack repeats one id at 0.5Hz for a long time
+    for (uint32_t t = 1000; t < 120000; t += 2000) {
+        id.feed(0xFFFF5B8CUL, t);
+        EXPECT_FALSE(id.active(t));
+    }
+    EXPECT_EQ(id.latest_id(), 0xFFFF5B8CUL);
+}
+
+TEST(ZhiannDecode, identity_dup_two_packs_detected)
+{
+    IdentityDupDetector id;
+    // real node-2 collision: two ids alternating about once a second
+    uint32_t t = 1000;
+    id.feed(0xFFFFBDBDUL, t);
+    EXPECT_FALSE(id.active(t));         // one id alone is not a duplicate
+    t += 1000;
+    id.feed(0xFFFFF6DBUL, t);
+    EXPECT_TRUE(id.active(t));          // second distinct id: duplicate
+    EXPECT_TRUE(id.id_a() == 0xFFFFBDBDUL || id.id_b() == 0xFFFFBDBDUL);
+    EXPECT_TRUE(id.id_a() == 0xFFFFF6DBUL || id.id_b() == 0xFFFFF6DBUL);
+    // sustained alternation keeps it active
+    for (int i = 0; i < 20; i++) {
+        t += 1000;
+        id.feed((i & 1) ? 0xFFFFBDBDUL : 0xFFFFF6DBUL, t);
+        EXPECT_TRUE(id.active(t));
+    }
+    // one pack removed: the stale entry ages out of the window
+    for (int i = 0; i < 10; i++) {
+        t += 1000;
+        id.feed(0xFFFFF6DBUL, t);
+    }
+    EXPECT_FALSE(id.active(t));
+}
+
+TEST(ZhiannDecode, identity_dup_ignores_sentinels_and_survives_wrap)
+{
+    IdentityDupDetector id;
+    id.feed(0, 1000);
+    id.feed(0xFFFFFFFFUL, 2000);
+    EXPECT_FALSE(id.active(2000));
+    EXPECT_EQ(id.latest_id(), 0u);
+    // millis() wrap must not fake freshness or staleness
+    IdentityDupDetector w;
+    const uint32_t near_wrap = 0xFFFFF000UL;
+    w.feed(0xAAAA1111UL, near_wrap);
+    w.feed(0xBBBB2222UL, near_wrap + 1000);
+    EXPECT_TRUE(w.active(near_wrap + 1000));
+    EXPECT_TRUE(w.active(uint32_t(near_wrap + 5000)));   // wrapped
+    EXPECT_FALSE(w.active(uint32_t(near_wrap + 60000))); // wrapped, stale
+}
+
+TEST(ZhiannDecode, soc_cadence_single_pack_never_trips)
+{
+    SocCadenceDupDetector d;
+    // one pack: 201ms median measured across every clean capture
+    for (uint32_t t = 1000; t < 60000; t += 201) {
+        d.feed(t);
+        EXPECT_FALSE(d.active(t));
+    }
+}
+
+TEST(ZhiannDecode, soc_cadence_two_packs_detected)
+{
+    SocCadenceDupDetector d;
+    uint32_t t = 1000;
+    for (int i = 0; i < 6; i++) { t += 201; d.feed(t); }
+    EXPECT_FALSE(d.active(t));
+    // second pack joins: merged interval halves to ~100ms
+    for (int i = 0; i < 10; i++) { t += 100; d.feed(t); }
+    EXPECT_TRUE(d.active(t));
+    // pack removed: returns to 201ms and the verdict clears
+    for (int i = 0; i < 30; i++) { t += 201; d.feed(t); }
+    EXPECT_FALSE(d.active(t));
+}
+
+TEST(ZhiannDecode, soc_cadence_ignores_retransmit_burst)
+{
+    // A pack alone on the bus retransmits every ~4ms until something ACKs,
+    // and the CAN RX queue drains back to back at startup. Neither is a
+    // duplicate; this is what caused the historical boot-time false alarms.
+    SocCadenceDupDetector d;
+    uint32_t t = 1000;
+    for (int i = 0; i < 500; i++) { t += 4; d.feed(t); }
+    EXPECT_FALSE(d.active(t));
+    for (int i = 0; i < 200; i++) { t += 1; d.feed(t); }
+    EXPECT_FALSE(d.active(t));
+    // and a genuine doubled cadence is still caught afterwards
+    for (int i = 0; i < 10; i++) { t += 100; d.feed(t); }
+    EXPECT_TRUE(d.active(t));
+}
+
+TEST(ZhiannDecode, soc_cadence_ignores_burst_exit_gaps)
+{
+    // Regression for the ONLY false positive in the 2026-08-13/14 corpus:
+    // swap capture, node 1, board time 2584091..2587138ms, 1.7s active on a
+    // node carrying a single pack (identity FFFFF6DB throughout).
+    //
+    // A pack alone on the bus storms retransmits at 4ms because nothing ACKs
+    // it. When another device comes up and starts ACKing, the storm breaks
+    // into bursts whose EXIT gaps land in the doubled band. MIN_GAP_MS filters
+    // the intra-burst 4ms spacing but says nothing about the exit gaps.
+    //
+    // The 11 scoring gaps below are the real ones, in order, over a 3047ms
+    // span. They walk the score 0 -> exactly 10, which is why ACTIVATE is 12.
+    SocCadenceDupDetector d;
+    const uint32_t scoring[] = {
+        70, 118, 176, 53, 77, 135, 237, 458, 58, 490, 57
+    };
+    uint32_t t = 1000;
+    for (uint8_t i = 0; i < sizeof(scoring) / sizeof(scoring[0]); i++) {
+        // the burst itself: retransmits below the floor, worth nothing
+        for (int j = 0; j < 20; j++) { t += 4; d.feed(t); }
+        t += scoring[i];
+        d.feed(t);
+        EXPECT_FALSE(d.active(t));
+    }
+    // pin the design decision: this sequence peaks at 10, so any threshold at
+    // or below that re-introduces the false positive
+    EXPECT_GT(SocCadenceDupDetector::ACTIVATE, 10);
+}
+
+TEST(ZhiannDecode, soc_cadence_silence_clears_the_verdict)
+{
+    // The score only moves when a frame arrives, so a collided pair that goes
+    // to deep sleep would otherwise keep reporting a duplicate forever against
+    // an empty bus.
+    SocCadenceDupDetector d;
+    uint32_t t = 1000;
+    for (int i = 0; i < 10; i++) { t += 100; d.feed(t); }
+    EXPECT_TRUE(d.active(t));
+    EXPECT_TRUE(d.active(t + 999));     // still within the silence window
+    EXPECT_FALSE(d.active(t + 1000));   // stream gone: no evidence either way
+    // and it re-detects cleanly once frames return
+    t += 5000;
+    for (int i = 0; i < 10; i++) { t += 100; d.feed(t); }
+    EXPECT_TRUE(d.active(t));
+}
+
+TEST(ZhiannDecode, soc_cadence_tolerates_dropped_frames)
+{
+    // a single dropped frame doubles the gap; hysteresis must not flap
+    SocCadenceDupDetector d;
+    uint32_t t = 1000;
+    for (int i = 0; i < 10; i++) { t += 100; d.feed(t); }
+    EXPECT_TRUE(d.active(t));
+    t += 402;               // two missed frames on a collided node
+    d.feed(t);
+    EXPECT_TRUE(d.active(t));
 }
 
 AP_GTEST_MAIN()

@@ -12,11 +12,17 @@ namespace ZhiannBMS {
 
 static const uint32_t BLOCK_BASE   = 0x2E0941UL;  // + 0x20 * node
 static const uint32_t SOC_BASE     = 0x401A100UL; // + node
+static const uint32_t PACKID_BASE  = 0x402A100UL; // + node, 2s identity frame
 static const uint8_t  MAX_NODE     = 15;
 static const uint8_t  ALARM_PF     = 0x24;
 static const uint8_t  CELL_SLICE_COUNT = 7;
-// nominal current scale, amps per LSB of the s32 in the PACK_VOLT frame
-static const float    CURRENT_SCALE = 0.002f;
+// Current scale, amps per LSB of the s32 in the PACK_VOLT frame.
+// 1 mA/LSB, established 2026-08-14: the pack broadcasts its own rated
+// capacity of 44.0 Ah, and coulomb-counting 14 pack-flights against the
+// packs' own SOC gives ~82 Ah apparent at 2 mA/LSB. The original 2 mA/LSB
+// came from correlating against an analog power module whose own
+// calibration was the weak link. BATTn_CURR_MULT trims residual error.
+static const float    CURRENT_SCALE = 0.001f;
 
 // on-wire block frame types (low 5 bits of id - BLOCK_BASE) plus
 // internal tags outside the 5-bit range
@@ -30,6 +36,7 @@ enum FrameType : uint8_t {
     FRAME_CELL_15_18 = 0x06,
     FRAME_CELL_23_24 = 0x09,
     FRAME_PACK_VOLT  = 0x10,
+    FRAME_PACK_ID    = 0xFD,
     FRAME_ALARM      = 0xFE,
     FRAME_SOC_COARSE = 0xFF,
 };
@@ -68,6 +75,14 @@ inline bool classify(uint32_t id, Classified &out)
         out.type = FRAME_SOC_COARSE;
         return true;
     }
+    // 2s frame carrying a per-pack identity in bytes 4..7. Emitted in
+    // standby as well as ON, so a duplicate node is detectable before the
+    // packs are even switched on.
+    if ((id & ~0xFUL) == PACKID_BASE) {
+        out.node = id & 0xF;
+        out.type = FRAME_PACK_ID;
+        return true;
+    }
     // Vendor-standard alarm PGN: any priority, R/DP zero, PF 0x24,
     // destination either the null address 0x00 or the controller class
     // 0xF0..0xFF, BMS source address 0x00..0xEF (including the vendor
@@ -103,11 +118,172 @@ inline uint8_t expected_dlc(uint8_t frame_type)
     case FRAME_CELL_15_18:
     case FRAME_PACK_VOLT:
     case FRAME_SOC_COARSE:
+    case FRAME_PACK_ID:
         return 8;
     default:
         return 0;
     }
 }
+
+// Per-pack identity from the 2s frame (needs dlc >= 8), stable per pack and
+// available without a polling master. Read in wire order rather than
+// little-endian like the numeric fields, so the printed value matches the
+// byte order seen in captures (FFFF5B8C, FFFFBDBD, ...).
+inline uint32_t pack_id(const uint8_t *d)
+{
+    return (uint32_t(d[4]) << 24) | (uint32_t(d[5]) << 16) |
+           (uint32_t(d[6]) << 8) | uint32_t(d[7]);
+}
+
+// Duplicate detection on the SOC-coarse stream.
+//
+// This is the primary duplicate detector because every pack emits this frame
+// on its own node, and it doubles while the second pack is still in standby -
+// roughly 150s before the detail frames double. Measured over the 2026-08-13
+// captures: one pack 201ms median (4.5/s), two packs 70-104ms (9/s).
+//
+// Intervals below MIN_GAP_MS are ignored. A node with nothing else on the bus
+// to ACK it retransmits every frame at ~4ms, and the CAN RX queue drains
+// back-to-back at startup; both look like an impossibly fast cadence and
+// caused the historical boot-time false duplicates. Validated over the corpus:
+// 70,922 sub-20ms gaps, of which 69,057 are the 4ms no-ACK retransmit and the
+// largest genuine queue-drain gap is 19ms. Dropping the floor to 0 produces
+// 433s of false activity, so it is load-bearing.
+//
+// ACTIVATE is 12, not 10. At 10 the corpus contains one real false positive:
+// a single pack alone on the bus was storming retransmits, another device came
+// up and began ACKing, and the burst-exit gaps (70, 118, 53, 77, 135, 58,
+// 57ms) scored seven +2 against one -1 and tripped at exactly 10. That
+// transition - an FC powering up on a bus where a pack is already storming -
+// is the normal power-on order for the aircraft, so it is not a corner case.
+// At 12 it does not trip, the worst single-pack excursion anywhere else in
+// 3.74h of single-pack node time is 4, and the cost is 0.09% of duplicate-time
+// coverage and ~0.2s of onset latency.
+//
+// Note the thresholds do not separate the two distributions with margin: 0.9%
+// of single-pack gaps land in the doubled band. What makes this safe is the
+// 2:1 scoring ratio, which requires a tight CLUSTER of doubled gaps rather
+// than any single one. The margin is statistical, not deterministic.
+class SocCadenceDupDetector {
+public:
+    static const uint32_t MIN_GAP_MS = 20;    // below: retransmit/queue drain
+    static const uint32_t DOUBLED_MS = 150;   // at or below: two packs
+    static const uint32_t SINGLE_MS  = 160;   // at or above: one pack
+    static const uint32_t SILENCE_MS = 1000;  // no frames at all: no evidence
+    static const uint8_t  SCORE_MAX  = 20;
+    static const uint8_t  ACTIVATE   = 12;
+    static const uint8_t  DEACTIVATE = 3;
+
+    void feed(uint32_t now_ms)
+    {
+        if (_last_ms != 0) {
+            const uint32_t dt = now_ms - _last_ms;
+            if (dt < MIN_GAP_MS) {
+                // artifact, carries no cadence information
+            } else if (dt <= DOUBLED_MS) {
+                _score = _score >= SCORE_MAX - 2 ? SCORE_MAX : _score + 2;
+            } else if (dt >= SINGLE_MS && _score > 0) {
+                _score--;
+            }
+        }
+        _last_ms = now_ms;
+        _seen_ms = now_ms;
+    }
+
+    // hysteresis stops a single dropped frame flapping the verdict
+    bool active(uint32_t now_ms)
+    {
+        // The score only moves when a frame arrives, so without this the
+        // verdict freezes forever once the stream stops - a collided pair that
+        // goes to deep sleep would keep reporting a duplicate against an empty
+        // bus. Silence is not evidence of anything, so drop the verdict.
+        //
+        // Keyed on frame ARRIVAL, not on scoring events: a surviving pack left
+        // alone and storming retransmits produces no scoring gaps at all, but
+        // it is still transmitting and the last cadence verdict is still the
+        // best evidence there is. That case clears the slow way (up to ~34s),
+        // which is a nuisance but errs toward blocking.
+        if (_seen_ms != 0 && now_ms - _seen_ms >= SILENCE_MS) {
+            reset();
+        }
+        if (!_active && _score >= ACTIVATE) {
+            _active = true;
+        } else if (_active && _score <= DEACTIVATE) {
+            _active = false;
+        }
+        return _active;
+    }
+
+    void reset() { _last_ms = 0; _seen_ms = 0; _score = 0; _active = false; }
+
+private:
+    uint32_t _last_ms = 0;
+    uint32_t _seen_ms = 0;  // last frame of any spacing, incl. retransmits
+    uint8_t _score = 0;
+    bool _active = false;
+};
+
+// Corroborating detector: names the two packs when it can see them.
+//
+// NOT a general duplicate detector. Not every occupied node emits the 2s
+// identity frame, and the rule governing which do is not known: across the
+// 2026-08-13/14 captures node 0 emitted it every time, other nodes emitted it
+// inconsistently, and in one capture three nodes emitted concurrently while an
+// occupied fourth stayed silent. What matters here is that two of the three
+// real collisions in the corpus produced no identity frames at all, so a
+// collision is usually invisible to this detector. Measured over the corpus:
+// zero false positives across ~4700s of single-pack node time, but only ~20%
+// of real duplicate time detected. Use SocCadenceDupDetector for detection and
+// this only to identify which packs are involved.
+class IdentityDupDetector {
+public:
+    void feed(uint32_t id, uint32_t now_ms)
+    {
+        if (id == 0 || id == 0xFFFFFFFFUL) {
+            return;                     // sentinel / not yet populated
+        }
+        if (_has_a && id == _id_a) { _seen_a = now_ms; return; }
+        if (_has_b && id == _id_b) { _seen_b = now_ms; return; }
+        if (!_has_a) { _id_a = id; _seen_a = now_ms; _has_a = true; return; }
+        if (!_has_b) { _id_b = id; _seen_b = now_ms; _has_b = true; return; }
+        // both slots taken by other ids: evict whichever was seen longer ago
+        if (uint32_t(now_ms - _seen_a) >= uint32_t(now_ms - _seen_b)) {
+            _id_a = id; _seen_a = now_ms;
+        } else {
+            _id_b = id; _seen_b = now_ms;
+        }
+    }
+
+    // two different packs have both been heard recently on this node
+    bool active(uint32_t now_ms, uint32_t window_ms = 6000) const
+    {
+        return _has_a && _has_b &&
+               uint32_t(now_ms - _seen_a) <= window_ms &&
+               uint32_t(now_ms - _seen_b) <= window_ms;
+    }
+
+    // the two contending ids, for the operator-facing message
+    uint32_t id_a() const { return _id_a; }
+    uint32_t id_b() const { return _id_b; }
+    // most recently heard id, i.e. whoever last spoke for this node
+    uint32_t latest_id() const
+    {
+        if (!_has_a) { return 0; }
+        if (!_has_b) { return _id_a; }
+        return uint32_t(_seen_a - _seen_b) < 0x80000000UL ? _id_a : _id_b;
+    }
+    void reset()
+    {
+        _has_a = _has_b = false;
+        _id_a = _id_b = 0;
+        _seen_a = _seen_b = 0;
+    }
+
+private:
+    uint32_t _id_a = 0, _id_b = 0;
+    uint32_t _seen_a = 0, _seen_b = 0;
+    bool _has_a = false, _has_b = false;
+};
 
 inline bool valid_dlc(uint8_t frame_type, uint8_t dlc)
 {
@@ -123,7 +299,7 @@ inline bool valid_dlc(uint8_t frame_type, uint8_t dlc)
 // PACK_VOLT frame (canonical dlc 8)
 inline float pack_voltage(const uint8_t *d) { return u16(&d[2]) * 0.01f; }
 
-// PACK_VOLT frame current (needs dlc >= 8): s32 LE, 2 mA/LSB, BMS uses
+// PACK_VOLT frame current (needs dlc >= 8): s32 LE, 1 mA/LSB, BMS uses
 // discharge-negative; returned with ArduPilot's discharge-positive sign
 inline float current_amps(const uint8_t *d)
 {

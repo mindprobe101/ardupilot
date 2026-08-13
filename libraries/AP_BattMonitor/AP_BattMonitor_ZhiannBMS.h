@@ -67,6 +67,9 @@ private:
     // broadcasting without a battery-monitor mapping
     void note_unmapped(uint32_t now_ms);
 
+    // duplicate-node warning, naming the packs when identity is available
+    void warn_duplicate(uint32_t now_ms);
+
     // ZBMS/ZBC1/ZBC2 dataflash messages, 2Hz per instance from read()
     void log_zbms();
 
@@ -119,6 +122,18 @@ private:
     uint32_t _cellcount_warn_ms = 0; // rate limit: cell count != 24
     // duplicate-node detection over PACK_VOLT frame arrival intervals
     ZhiannBMS::DupDetector _dup;
+    // independent, deterministic duplicate detection from the per-pack id
+    // in the 2s frame; also works while the packs are in standby
+    ZhiannBMS::IdentityDupDetector _identity_dup;
+    uint32_t _pack_id = 0;          // most recent id seen for this node
+    uint32_t _unbound_warn_ms = 0;  // rate limit: configured but never bound
+    uint32_t _coherence_since_ms = 0; // start of the current coherence fault
+    bool _was_armed = false;        // arm edge: restarts the coherence hold
+    bool _ever_heard = false;       // any frame ever seen for this instance
+    // Duplicate detection on the SOC-coarse stream. Unlike the identity
+    // frame this is emitted by EVERY pack on its own node, and it doubles
+    // while the second pack is still in standby.
+    ZhiannBMS::SocCadenceDupDetector _soc_dup;
     uint8_t _soc_pct = 0;
     bool _soc_valid = false;
     bool _current_seen = false;
