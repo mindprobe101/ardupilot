@@ -356,6 +356,31 @@ TEST(ZhiannDecode, dup_detector)
 
 }
 
+TEST(ZhiannDecode, dup_detector_ignores_startup_burst)
+{
+    // Regression for the bench false positive of 2026-08-14: the first of four
+    // packs to power on emitted a burst of PACK_VOLT frames on an otherwise
+    // quiet bus, tripping a duplicate on node 0 within one second and holding
+    // it 9.5s. A single pack runs at 508ms, and spacing this tight is a
+    // startup burst or queue drain, never a collision.
+    DupDetector d;
+    uint32_t t = 1000;
+    for (int i = 0; i < 200; i++) { t += 4; d.feed(t); }
+    EXPECT_FALSE(d.active());
+    for (int i = 0; i < 50; i++) { t += 19; d.feed(t); }   // largest drain gap
+    EXPECT_FALSE(d.active());
+    // A genuine collision is still caught. Two packs do NOT split the period
+    // evenly: they hold a locked phase offset, so the stream alternates a
+    // short gap with a long one. 40/468 is the corpus median for both packs
+    // that collided on 2026-08-13, and 36ms is the smallest short gap seen -
+    // only 16ms above the floor above.
+    for (int i = 0; i < 10; i++) { t += 40; d.feed(t); t += 468; d.feed(t); }
+    EXPECT_TRUE(d.active());
+    // and a single pack clears it again
+    for (int i = 0; i < 30; i++) { t += 508; d.feed(t); }
+    EXPECT_FALSE(d.active());
+}
+
 TEST(ZhiannDecode, coherence_detector_holds_until_clean_run)
 {
     CoherenceDetector detector;

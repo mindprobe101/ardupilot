@@ -498,6 +498,28 @@ private:
 // keeps a single glitch from flapping the state
 class DupDetector {
 public:
+    // Same retransmit/queue-drain floor as SocCadenceDupDetector, and for the
+    // same reason. Without it the first pack to appear on a quiet bus emits a
+    // startup burst of PACK_VOLT frames whose sub-millisecond spacing scores
+    // as an impossibly fast cadence: observed on the bench 2026-08-14, where
+    // the first of four packs tripped a false duplicate on node 0 within one
+    // second and held it 9.5s (decay here is one point per ~508ms detail
+    // frame). The packs that joined 2s later onto an already-busy bus showed
+    // clean 508ms cadence from their first frame and never tripped.
+    //
+    // DO NOT RAISE THIS FLOOR. Two packs on one node do not interleave evenly
+    // at ~254ms; they hold a locked, small phase offset and alternate a short
+    // gap with a long one. Measured over the corpus, the short gaps have
+    // median 40ms and minimum 36ms, so 20ms sits only 16ms below the real
+    // collision signature. Replay confirms it: at 20ms the floor removes 5 of
+    // the 6 single-pack false positives (~10s each) while all three genuine
+    // collisions are still detected to within 0.5s of their full duration.
+    //
+    // The sixth is a pack handover on an occupied node, where the data really
+    // is a mixture while it happens; raising the activation threshold to 16
+    // does not remove it, so it is left to the settling window to keep quiet.
+    static const uint32_t MIN_GAP_MS = 20;
+
     void feed(uint32_t now_ms)
     {
         if (_last_ms != 0) {
@@ -514,7 +536,7 @@ public:
             } else {
                 _clean_intervals = 0;
             }
-            if (dt < 300) {
+            if (dt >= MIN_GAP_MS && dt < 300) {
                 _score = _score >= 18 ? 20 : _score + 2;
             } else if (dt >= 400 && _score > 0) {
                 _score--;

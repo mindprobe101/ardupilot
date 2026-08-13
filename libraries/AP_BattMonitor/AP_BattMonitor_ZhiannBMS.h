@@ -78,6 +78,10 @@ private:
     static AP_BattMonitor_ZhiannBMS *_instances[AP_BATT_MONITOR_MAX_INSTANCES];
     static uint8_t _num_instances;
     static uint16_t _nodes_announced;   // fleet inventory: one GCS info per node
+    static uint32_t _bus_settle_ms;     // last time a new node appeared
+    // true once the fleet has stopped growing: gates operator warnings that
+    // would otherwise describe a half-formed bus during power-on
+    static bool bus_settled(uint32_t now_ms);
     static uint32_t _unmapped_warn_ms[ZhiannBMS::MAX_NODE + 1];
     static bool _misconfig_checked;     // one-time configuration audit done
 

@@ -115,6 +115,14 @@ static const struct {
 // failsafe that latches for the remainder of the flight.
 #define ZHIANN_COHERENCE_HOLD_MS  3000
 
+// Packs do not power on together: on the bench 2026-08-14 four packs switched
+// on by one operator action appeared over 2.5s. Until the last one has
+// claimed, the bus is a half-formed fleet, so collision and instance-count
+// warnings describe a state that is about to stop being true. Hold those
+// MESSAGES until no new node has appeared for this long. Health gating is
+// deliberately NOT delayed - arming stays blocked throughout.
+#define ZHIANN_BUS_SETTLE_MS  5000
+
 // Across 35,613 complete captured bursts, all seven slices span 22..55ms.
 // This margin tolerates bus/scheduler jitter but rejects a set assembled
 // from different nominal 500ms generations after a slice is lost.
@@ -159,6 +167,7 @@ AP_BattMonitor_ZhiannBMS_CAN *AP_BattMonitor_ZhiannBMS::_can_driver;
 AP_BattMonitor_ZhiannBMS *AP_BattMonitor_ZhiannBMS::_instances[AP_BATT_MONITOR_MAX_INSTANCES];
 uint8_t AP_BattMonitor_ZhiannBMS::_num_instances;
 uint16_t AP_BattMonitor_ZhiannBMS::_nodes_announced;
+uint32_t AP_BattMonitor_ZhiannBMS::_bus_settle_ms;
 uint32_t AP_BattMonitor_ZhiannBMS::_unmapped_warn_ms[ZhiannBMS::MAX_NODE + 1];
 bool AP_BattMonitor_ZhiannBMS::_misconfig_checked;
 
@@ -258,6 +267,11 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
     if (!(_nodes_announced & (1U << node))) {
         _nodes_announced |= (1U << node);
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ZhiannBMS: pack on node %u", node);
+        // A node appearing means the fleet is still arriving. Restart the
+        // settling window so collision and instance-count warnings wait until
+        // every pack has had a chance to claim; see read(). Plain 32-bit
+        // store, read from the main thread, as with _nodes_announced above.
+        _bus_settle_ms = AP_HAL::millis();
     }
 
     // pass 1: an instance already bound to this node (explicit serial
@@ -300,6 +314,14 @@ bool AP_BattMonitor_ZhiannBMS::dispatch_frame(AP_HAL::CANFrame &frame)
                       node);
     }
     return false;
+}
+
+// Has the fleet stopped growing? Nothing heard yet counts as unsettled: with
+// no packs on the bus there is nothing worth reporting either way.
+bool AP_BattMonitor_ZhiannBMS::bus_settled(uint32_t now_ms)
+{
+    return _bus_settle_ms != 0 &&
+           now_ms - _bus_settle_ms >= ZHIANN_BUS_SETTLE_MS;
 }
 
 // Name the two packs when the identity frame can see them, so the operator
@@ -733,7 +755,7 @@ void AP_BattMonitor_ZhiannBMS::read()
         // frames that keep flowing in standby, and clearing them would blind
         // exactly the case this branch exists to report.
         _dup_active = _soc_dup.active(now_ms) || _identity_dup.active(now_ms);
-        if (_dup_active &&
+        if (_dup_active && bus_settled(now_ms) &&
             (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
             _dup_warn_ms = now_ms;
             warn_duplicate(now_ms);
@@ -790,7 +812,7 @@ void AP_BattMonitor_ZhiannBMS::read()
         // the primary documented configuration. _ever_heard is set at the top
         // of read() on every path; the peer reads below are main-thread-only
         // values also written under read().
-        if (!_ever_heard &&
+        if (!_ever_heard && bus_settled(now_ms) &&
             (_unbound_warn_ms == 0 || now_ms - _unbound_warn_ms >= 30000)) {
             uint8_t live = 0;
             for (uint8_t i = 0; i < _num_instances; i++) {
@@ -932,7 +954,7 @@ void AP_BattMonitor_ZhiannBMS::read()
     if (_dup_active || !_dup.qualified()) {
         _state.healthy = false;
     }
-    if (_dup_active &&
+    if (_dup_active && bus_settled(now_ms) &&
         (_dup_warn_ms == 0 || now_ms - _dup_warn_ms >= 30000)) {
         _dup_warn_ms = now_ms;
         warn_duplicate(now_ms);
