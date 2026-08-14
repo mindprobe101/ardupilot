@@ -39,6 +39,9 @@ public:
     // BMS-reported SOC, averaged across the packs
     bool capacity_remaining_pct(uint8_t &percentage) const override;
 
+    // name the actual problem instead of ArduPilot's bare "unhealthy"
+    bool arming_checks(char *buffer, size_t buflen) const override;
+
     // faults decoded from the BMS alarm frame (PF 0x24)
     uint32_t get_mavlink_fault_bitmask() const override { return _fault_bitmask; }
 
@@ -115,6 +118,7 @@ private:
     // operator messaging state
     uint32_t _bus_settle_ms = 0;    // last time a new node appeared
     uint32_t _imbalance_warn_ms = 0;
+    uint32_t _imbalance_since_ms = 0;  // imbalance must persist to be reported
     uint32_t _lost_warn_ms = 0;
     uint32_t _alarm_gcs_ms = 0;
     uint32_t _dup_warn_ms = 0;
@@ -122,6 +126,7 @@ private:
     uint16_t _nodes_announced = 0;  // bitmask: one info message per node
     uint8_t  _expected_packs = 0;   // count at settle, to notice a loss
     bool     _inventory_done = false;
+    uint8_t  _standby_packs = 0;    // present, sending SOC, not delivering
 
     // published copies for the lock-free accessors
     uint32_t _fault_bitmask = 0;

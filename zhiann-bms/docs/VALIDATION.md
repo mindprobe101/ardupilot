@@ -65,8 +65,18 @@ Validation date: 2026-07-22. Reviewed base: ArduCopter 4.6.3 branch commit
   Leave `BATT_CAPACITY` at 0 and use voltage-based failsafes.
 - Alarms remain unbenchmarked, and flash headroom is tight enough that it must
   be rechecked on every rebuild rather than assumed.
-- The 1 mA/LSB current scale has not been confirmed under load on the aircraft.
-  Bench runs on 2026-08-14 had all four packs idle, where the BMS reports
-  exactly 0 A, so the scale is still supported only by the pack's own rated
-  capacity and coulomb counting. Confirm it against a load before relying on
-  consumed-mAh figures.
+- **The 1 mA/LSB current scale is confirmed under load** (2026-08-14, 785 s,
+  four packs, 354 A peak). Coulomb counting against the packs' own SOC implies
+  a set capacity of 166-168 Ah in the linear part of the discharge curve
+  against a 176 Ah nameplate, i.e. 94-95 % of rated, which matches the
+  independent 14-flight estimate. Taken across the whole flight the figure is
+  144 Ah, but that is dragged down by the top of the SOC curve, where the BMS
+  holds near 100 % and then drops quickly: the per-band figures run 91.7,
+  112.5, 159.6, 167.8, 165.9, 167.0 Ah from 100 % down to 70 %. Judge the scale
+  only in the linear region.
+- Aggregation verified against the per-node log rows: mean voltage, summed
+  current and the spread statistics matched an independent recomputation on
+  every paired sample, and 1331 of 1331 loaded samples confirmed current is
+  summed rather than averaged.
+- Not yet exercised on hardware: a node collision under the current firmware,
+  and the imbalance warning firing on a genuinely faulty pack.

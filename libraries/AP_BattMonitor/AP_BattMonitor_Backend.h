@@ -77,7 +77,9 @@ public:
     virtual AP_BattMonitor::Failsafe update_failsafes(void);
 
     // returns false if we fail arming checks, in which case the buffer will be populated with a failure message
-    bool arming_checks(char * buffer, size_t buflen) const;
+    // virtual so a backend can explain WHY it is unhealthy; the base text is
+    // only "unhealthy", which sends an operator looking in the wrong place
+    virtual bool arming_checks(char * buffer, size_t buflen) const;
 
     // reset remaining percentage to given value
     virtual bool reset_remaining(float percentage);

@@ -123,24 +123,30 @@ static const struct {
 // value needed to reach any sane threshold cannot occur while the packs are
 // electrically tied in parallel.
 //
-// The failure this must catch is a pack whose contactor has opened, which
-// shows as its unloaded open-circuit voltage sitting above the loaded bus by
-// around a volt and a half.
+// Calibrated against a 785 s flight on 2026-08-14, four packs, 354 A peak:
 //
-// NOT CALIBRATED UNDER LOAD. At rest four packs measured a 0.84 V spread,
-// which is pure BMS measurement offset because no current is flowing, and
-// 1.5 V is roughly twice that. Under load the healthy spread widens with each
-// pack's internal resistance and nobody has measured by how much, so this may
-// need raising. The current spread is the decisive in-flight check; at rest an
-// open pack is undetectable by any means, since with no current it reads the
-// same voltage as the bus.
+//   voltage spread   median 0.13 V, p95 0.21 V, max 0.56 V (at >150 A)
+//   current spread   median 1.7 % of total, p95 4.7 %, steady-state 2 A on 354 A
+//   SOC spread       max 2.1 %
 //
-// Current is only judged once the set is actually delivering, because sharing
-// at idle is meaningless and the BMS reports exactly 0 A below a few amps.
-#define ZHIANN_IMBALANCE_V_SPREAD    1.5f    // volts
+// So 1.0 V leaves 1.8x margin on the worst observed value while still sitting
+// below the ~1.5 V a pack shows when its contactor opens and it floats at its
+// unloaded voltage above the loaded bus.
+//
+// Current is judged as a FRACTION of the total, not an absolute. An absolute
+// 30 A threshold fired four times in that flight, every one of them a
+// throttle transient where the BMS deadband parks a pack at exactly 0 A while
+// its neighbours ramp - the packs shared 88.6/87.5/88.8/89.5 A at peak load.
+// A quarter of the total is 5x the p95 of healthy sharing and still catches a
+// pack that has stopped contributing entirely.
+#define ZHIANN_IMBALANCE_V_SPREAD    1.0f    // volts
 #define ZHIANN_IMBALANCE_SOC_SPREAD  15.0f   // percent
-#define ZHIANN_IMBALANCE_I_SPREAD    30.0f   // amps
+#define ZHIANN_IMBALANCE_I_FRACTION  0.25f   // of total current
 #define ZHIANN_IMBALANCE_I_FLOOR     20.0f   // mean amps before current judged
+
+// The transients above are single samples; a real imbalance persists. Require
+// the condition to hold this long before saying anything.
+#define ZHIANN_IMBALANCE_HOLD_MS     3000
 
 const AP_Param::GroupInfo AP_BattMonitor_ZhiannBMS::var_info[] = {
 
@@ -344,8 +350,7 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
     // anyway, and a running sum of squares would lose the spread to float
     // cancellation at ~102V (see ZhiannBMS::reduce).
     float v[ARRAY_SIZE(_nodes)], amps[ARRAY_SIZE(_nodes)], soc[ARRAY_SIZE(_nodes)];
-    uint32_t cell_sum[24] {};
-    uint8_t live = 0, n_current = 0, n_soc = 0, with_cells = 0, with_temp = 0;
+    uint8_t live = 0, n_current = 0, n_soc = 0, with_temp = 0, standby = 0;
     float t_max = 0;
     _dup_any = false;
 
@@ -360,6 +365,7 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
         }
         // present but not contributing: a pack in standby broadcasts SOC only
         if (!ZhiannBMS::fresh_ms(now_ms, n.detail_ms, ZHIANN_NODE_TIMEOUT_MS)) {
+            standby++;
             continue;
         }
         n.contributing = true;
@@ -382,14 +388,9 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
             }
             with_temp++;
         }
-        if (n.cell_count == 24 &&
-            ZhiannBMS::fresh_ms(now_ms, n.cells_ms, ZHIANN_NODE_TIMEOUT_MS)) {
-            for (uint8_t c = 0; c < 24; c++) {
-                cell_sum[c] += n.cells[c];
-            }
-            with_cells++;
-        }
     }
+
+    _standby_packs = standby;
 
     if (live == 0) {
         // no pack delivering: report zero rather than freezing the last
@@ -398,7 +399,6 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
         _state.healthy = false;
         _state.voltage = 0;
         _state.current_amps = 0;
-        _has_cell_voltages = false;
         _has_temperature = false;
         _soc_valid = false;
         // _has_current is deliberately left alone: it says the pack set is
@@ -419,8 +419,14 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
     ZhiannBMS::reduce(soc, n_soc, mean_soc, _spread_soc, _sd_soc);
 
     _state.voltage = mean_v;
-    // parallel packs: the set draws the sum of what its packs report
-    _state.current_amps = mean_i * n_current;
+    // Parallel packs: the set draws the SUM of what its packs report, not the
+    // average. Summed explicitly rather than as mean x count, so it cannot be
+    // misread as an average by anyone changing this later.
+    float i_sum = 0;
+    for (uint8_t k = 0; k < n_current; k++) {
+        i_sum += amps[k];
+    }
+    _state.current_amps = i_sum;
     _mean_current = mean_i;
 
     // Averaged over the packs that actually reported it, not over the whole
@@ -431,20 +437,17 @@ uint8_t AP_BattMonitor_ZhiannBMS::aggregate(uint32_t now_ms, uint64_t now_us)
         _soc_pct = uint8_t(constrain_float(mean_soc + 0.5f, 0, 100));
     }
 
+    // Cell voltages are deliberately NOT published to the front end. MAVLink
+    // carries at most 14 of the 24, and GCS_MAVLINK::send_battery_status()
+    // then distributes the missing voltage across the ones it does send so
+    // their sum matches pack voltage - which shows ~7.3 V per cell on a 4.2 V
+    // chemistry. Relative differences survive that, but the absolute number
+    // cannot be read at face value and invites a wrong call in the field.
+    // ZBC1/ZBC2 carry all 24 real cells per pack instead.
     _has_temperature = with_temp > 0;
     if (_has_temperature) {
         _state.temperature = t_max;
         _state.temperature_time = now_ms;
-    }
-
-    _has_cell_voltages = with_cells > 0;
-    if (_has_cell_voltages) {
-        for (uint8_t c = 0; c < ARRAY_SIZE(_state.cell_voltages.cells); c++) {
-            _state.cell_voltages.cells[c] = uint16_t(cell_sum[c] / with_cells);
-        }
-    } else {
-        memset(_state.cell_voltages.cells, 0xFF,
-               sizeof(_state.cell_voltages.cells));
     }
 
     // consumption from the summed current, integrated once for the set
@@ -614,11 +617,20 @@ void AP_BattMonitor_ZhiannBMS::report_imbalance(uint32_t now_ms)
         what = "SOC";
         value = _spread_soc;
     } else if (fabsf(_mean_current) > ZHIANN_IMBALANCE_I_FLOOR &&
-               _spread_current > ZHIANN_IMBALANCE_I_SPREAD) {
+               _spread_current >
+                   fabsf(_state.current_amps) * ZHIANN_IMBALANCE_I_FRACTION) {
         what = "A";
         value = _spread_current;
     }
     if (what == nullptr) {
+        _imbalance_since_ms = 0;
+        return;
+    }
+    // hold: a throttle step alone must not raise this
+    if (_imbalance_since_ms == 0) {
+        _imbalance_since_ms = now_ms;
+    }
+    if (now_ms - _imbalance_since_ms < ZHIANN_IMBALANCE_HOLD_MS) {
         return;
     }
     if (_imbalance_warn_ms != 0 && now_ms - _imbalance_warn_ms < 30000) {
@@ -627,6 +639,44 @@ void AP_BattMonitor_ZhiannBMS::report_imbalance(uint32_t now_ms)
     _imbalance_warn_ms = now_ms;
     GCS_SEND_TEXT(MAV_SEVERITY_WARNING,
                   "ZhiannBMS: packs differ by %.1f %s", (double)value, what);
+}
+
+// ArduPilot reports a failed backend check as "Battery N unhealthy", which
+// says nothing about what to do. Every way this backend can be unhealthy has a
+// specific and different remedy, so name it.
+bool AP_BattMonitor_ZhiannBMS::arming_checks(char *buffer, size_t buflen) const
+{
+    if (_singleton != this) {
+        char pfx[3] {};
+        if (_state.instance > 0) {
+            hal.util->snprintf(pfx, sizeof(pfx), "%X",
+                               unsigned(_state.instance + 1));
+        }
+        hal.util->snprintf(buffer, buflen,
+                           "ZhiannBMS: set BATT%s_MONITOR=0, one instance only",
+                           pfx);
+        return false;
+    }
+    if (_can_driver == nullptr) {
+        hal.util->snprintf(buffer, buflen, "ZhiannBMS: no CAN driver");
+        return false;
+    }
+    if (!_state.healthy) {
+        // the only way this backend is unhealthy is that no pack is
+        // delivering; distinguish "switched off" from "not there", because
+        // the first is fixed by pressing a button and the second is not
+        if (_standby_packs > 0) {
+            hal.util->snprintf(buffer, buflen,
+                               "ZhiannBMS: %u pack%s present but switched off",
+                               unsigned(_standby_packs),
+                               _standby_packs == 1 ? "" : "s");
+        } else {
+            hal.util->snprintf(buffer, buflen, "ZhiannBMS: no packs on the bus");
+        }
+        return false;
+    }
+    // healthy: fall through to the standard voltage and capacity checks
+    return AP_BattMonitor_Backend::arming_checks(buffer, buflen);
 }
 
 bool AP_BattMonitor_ZhiannBMS::capacity_remaining_pct(uint8_t &percentage) const

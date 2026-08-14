@@ -55,25 +55,27 @@ ZhiannBMS: packs differ by 1.6 V     (the packs stopped agreeing)
 The last one is the check that averaging would otherwise hide: a mean says
 nothing about whether one pack has collapsed. The driver measures the **spread**
 (highest minus lowest) of pack voltage, current and state of charge and warns
-when it stops looking normal — thresholds 1.5 V, 15 %, 30 A.
+when it stops looking normal, after the condition has held for 3 s.
 
-Spread, not standard deviation: standard deviation shrinks as packs are added,
-so the same physical fault would read 0.50x its size on two packs and 0.40x on
-five, and a fixed threshold would mean different things on different flights.
-The realistic failure — a pack whose contactor has opened, sitting at its
-unloaded voltage roughly 1.5 V above the loaded bus — is caught at 1.0 V spread
-but would not have reached any sane standard-deviation threshold. Current is
-judged only once the set is delivering, because sharing at idle is meaningless
-and the BMS reports exactly 0 A below a few amps.
+Thresholds are calibrated against a 785 s flight on 2026-08-14, four packs,
+354 A peak:
 
-**The voltage threshold is not yet calibrated under load.** Four packs at rest
-measured a 0.84 V spread — pure BMS measurement offset, since no current
-flows — and 1.5 V is set at roughly twice that. Under load the healthy spread
-will widen with each pack's internal resistance, and nobody has measured by how
-much. Check the `DV` column against a real flight and adjust before trusting
-it. Note also that at rest an open-circuit pack is undetectable by any means:
-with no current flowing it reads the same voltage as the bus. The current
-spread is the decisive in-flight check.
+| | measured healthy | threshold |
+|---|---|---|
+| voltage spread | median 0.13 V, max 0.56 V | **1.0 V** |
+| current spread | median 1.7 % of total, p95 4.7 % | **25 % of total** |
+| SOC spread | max 2.1 % | **15 %** |
+
+Current is judged as a fraction of the total rather than an absolute, and only
+above 20 A. At peak load the four packs shared 88.6/87.5/88.8/89.5 A — an
+absolute 30 A threshold fired four times in that flight, every one a throttle
+transient where the BMS deadband parks a pack at exactly 0 A while its
+neighbours ramp. The 3 s hold removes those.
+
+Cell voltages are **not** sent over MAVLink. ArduPilot can carry at most 14 of
+the 24 and rescales them so their sum matches pack voltage, which displays
+~7.3 V per cell on a 4.2 V chemistry — a number that cannot be read at face
+value. All 24 real cells per pack are in the `ZBC1`/`ZBC2` dataflash messages.
 
 Health is simple: the battery is healthy while **at least one pack** is
 delivering complete, fresh data.
